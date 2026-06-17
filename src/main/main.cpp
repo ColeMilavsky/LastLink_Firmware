@@ -2,21 +2,17 @@
 #include "../serial/serial_handler.h"
 #include "../mesh/mesh.h"
 #include "../lora/lora.h"
-#include "config.h"
+#include "../../include/config.h"
 
-// ─── Setup ────────────────────────────────────────────────────────────────────
 void setup() {
     Serial.begin(115200);
-    //unsigned long start = millis();
-    //while (!Serial && millis() - start < 5000) { delay(10); }
     delay(2000);
 
     Serial.println("[SYS] Booting...");
 
     int state = loraBegin();
     if (state != RADIOLIB_ERR_NONE) {
-        Serial.printf("[LoRa] INIT FAILED: %d\n", state);
-        Serial.printf("[LoRa] %s\n", String(stateDecode(state)).c_str());
+        Serial.printf("[LoRa] INIT FAILED: %s\n", String(stateDecode(state).c_str()));
         while (true) { delay(1000); }
     }
 
@@ -32,7 +28,6 @@ void setup() {
     Serial.println("─────────────────────────────────");
 }
 
-// ─── Loop ─────────────────────────────────────────────────────────────────────
 void loop() {
     SerialInput.update();
 
@@ -43,8 +38,15 @@ void loop() {
         if (state == RADIOLIB_ERR_NONE) {
             int   rssi = (int)radio.getRSSI();
             float snr  = radio.getSNR();
-            Serial.printf("\n>>> [RX | RSSI: %d | SNR: %.1f] %s\n\n",
-                          rssi, snr, received.c_str());
+            Serial.println();
+            Serial.println("┌─────────────────────────────────┐");
+            Serial.printf( "│ RX  RSSI: %4d dBm  SNR: %5.1f  │\n", rssi, snr);
+            Serial.println("│                                 │");
+            Serial.printf( "│  %s\n", received.c_str());
+            Serial.println("└─────────────────────────────────┘");
+            Serial.println();
+        } else {
+            Serial.printf("[LoRa] RX error: %s\n", stateDecode(state).c_str());
         }
         radio.startReceive();
     }

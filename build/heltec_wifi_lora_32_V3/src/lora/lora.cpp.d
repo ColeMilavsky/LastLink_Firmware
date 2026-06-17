@@ -365,4 +365,4 @@ build/heltec_wifi_lora_32_V3/src/lora/lora.cpp.o: src/lora/lora.cpp \
  .pio/libdeps/heltec_wifi_lora_32_V3/RadioLib/src/protocols/ADSB/../../TypeDef.h \
  .pio/libdeps/heltec_wifi_lora_32_V3/RadioLib/src/protocols/ADSB/../PhysicalLayer/PhysicalLayer.h \
  .pio/libdeps/heltec_wifi_lora_32_V3/RadioLib/src/utils/CRC.h \
- src/lora/lora.h include/config.h
+ src/lora/lora.h src/lora/../../include/config.h

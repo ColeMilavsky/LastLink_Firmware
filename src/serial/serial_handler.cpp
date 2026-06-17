@@ -1,5 +1,5 @@
 #include "serial_handler.h"
-#include "../include/config.h"
+#include "../../include/config.h"
 
 SerialHandler SerialInput;
 

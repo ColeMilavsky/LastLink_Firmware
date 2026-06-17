@@ -367,4 +367,4 @@ build/heltec_wifi_lora_32_V3/src/main/main.cpp.o: src/main/main.cpp \
  .pio/libdeps/heltec_wifi_lora_32_V3/RadioLib/src/protocols/ADSB/../../TypeDef.h \
  .pio/libdeps/heltec_wifi_lora_32_V3/RadioLib/src/protocols/ADSB/../PhysicalLayer/PhysicalLayer.h \
  .pio/libdeps/heltec_wifi_lora_32_V3/RadioLib/src/utils/CRC.h \
- src/main/config.h
+ src/main/../../include/config.h
