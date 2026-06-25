@@ -43,24 +43,13 @@ int loraBegin() {
 }
 
 // ─── Send over LoRa ───────────────────────────────────────────────────────────
-void loraSend(const String& message) {
+int loraSend(const String& message) {
     radio.clearDio1Action();
     String msg = message;
     int state = radio.transmit(msg);
-
-    if (state == RADIOLIB_ERR_NONE) {
-        Serial.println();
-        Serial.println("┌─────────────────────────────────┐");
-        Serial.println("│ TX sent                         │");
-        Serial.printf( "│  %s\n", message.c_str());
-        Serial.println("└─────────────────────────────────┘");
-        Serial.println();
-    } else {
-        Serial.printf("[LoRa] TX failed: %s\n");
-    }
-
     radio.setDio1Action(onReceive);
     radio.startReceive();
+    return state;
 }
 
 void onSerialLine(const String& line) {

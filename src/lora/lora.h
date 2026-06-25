@@ -10,7 +10,7 @@ extern volatile bool rxFlag;
 
 void IRAM_ATTR onReceive();
 int loraBegin();
-void loraSend(const String& message);
+int loraSend(const String& message);
 void onSerialLine(const String& line);
 
 #endif // LORA_H
