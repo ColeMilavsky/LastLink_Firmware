@@ -42,13 +42,43 @@ int loraBegin() {
     return RADIOLIB_ERR_NONE;
 }
 
-// ─── Send over LoRa ───────────────────────────────────────────────────────────
+// ─── Send over LoRa (plain text — legacy path, kept for compatibility) ────────
 int loraSend(const String& message) {
     radio.clearDio1Action();
     String msg = message;
     int state = radio.transmit(msg);
     radio.setDio1Action(onReceive);
     radio.startReceive();
+    return state;
+}
+
+// ─── Send over LoRa (raw bytes — used by the mesh packet framing) ────────────
+int loraSendRaw(const uint8_t* data, size_t len) {
+    radio.clearDio1Action();
+    int state = radio.transmit((uint8_t*)data, len);
+    radio.setDio1Action(onReceive);
+    radio.startReceive();
+    return state;
+}
+
+// ─── Receive raw bytes off the radio ──────────────────────────────────────────
+// outLen (input) is the capacity of outBuf; on return it holds the actual
+// number of bytes received. Per RadioLib's API, getPacketLength() must be
+// called BEFORE readData() to know how much was actually received.
+int loraReceiveRaw(uint8_t* outBuf, size_t& outLen) {
+    size_t capacity = outLen;
+    size_t received = radio.getPacketLength();
+
+    if (received == 0) {
+        outLen = 0;
+        return RADIOLIB_ERR_RX_TIMEOUT;
+    }
+    if (received > capacity) {
+        received = capacity; // truncate rather than overflow the caller's buffer
+    }
+
+    int state = radio.readData(outBuf, received);
+    outLen = (state == RADIOLIB_ERR_NONE) ? received : 0;
     return state;
 }
 

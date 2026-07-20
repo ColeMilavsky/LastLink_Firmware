@@ -208,4 +208,5 @@ build/heltec_wifi_lora_32_V3/src/BLE/BLE_handler.cpp.o: \
  C:/Users/colem/.platformio/packages/framework-arduinoespressif32/libraries/BLE/src/BLEUtils.h \
  C:/Users/colem/.platformio/packages/framework-arduinoespressif32/libraries/BLE/src/BLEServer.h \
  C:/Users/colem/.platformio/packages/framework-arduinoespressif32/libraries/BLE/src/BLEUtils.h \
- C:/Users/colem/.platformio/packages/framework-arduinoespressif32/libraries/BLE/src/BLE2902.h
+ C:/Users/colem/.platformio/packages/framework-arduinoespressif32/libraries/BLE/src/BLE2902.h \
+ C:/Users/colem/.platformio/packages/framework-arduinoespressif32/libraries/BLE/src/BLESecurity.h
