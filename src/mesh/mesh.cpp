@@ -11,6 +11,7 @@ MeshLayer::MeshLayer()
       _chatCallback(nullptr),
       _directoryCallback(nullptr),
       _deliveryCallback(nullptr),
+      _routeCallback(nullptr),
       _seenCacheIndex(0),
       _lastPresenceBroadcast(0) {}
 
@@ -53,12 +54,14 @@ void MeshLayer::setLocalNickname(const String& nickname) {
 }
 
 // In: destNickname - target phone's nickname (empty/unknown means broadcast);
-//     message - chat text to send.
+//     message - chat text to send; outDestNode/outMsgId - optional (may be
+//     null) out-params receiving the resolved destination and assigned msgId.
 // Out: true if the radio accepted the transmission, false on a hard radio error.
 // Resolves the nickname to a node id and next hop (if a route is known),
 // builds and sends a MSG_CHAT packet, and registers a pending ACK for
 // unicast sends so delivery status can be reported later.
-bool MeshLayer::sendChat(const String& destNickname, const String& message) {
+bool MeshLayer::sendChat(const String& destNickname, const String& message,
+                          char* outDestNode, uint8_t* outMsgId) {
     char destNode = NODE_BROADCAST;
     bool resolved = resolveNickname(destNickname, destNode);
 
@@ -88,6 +91,9 @@ bool MeshLayer::sendChat(const String& destNickname, const String& message) {
     if (destNode != NODE_BROADCAST) {
         _addPendingAck(destNode, msgId);
     }
+
+    if (outDestNode) *outDestNode = destNode;
+    if (outMsgId)    *outMsgId    = msgId;
 
     int state = loraSendRaw(packet, packetLen);
     return state == 0; // RADIOLIB_ERR_NONE
@@ -230,6 +236,12 @@ void MeshLayer::onDeliveryStatus(MeshDeliveryCallback callback) {
     _deliveryCallback = callback;
 }
 
+// In: callback - function to invoke when the routing table gains, updates,
+//     or loses an entry. Out: none.
+void MeshLayer::onRouteChanged(MeshRouteCallback callback) {
+    _routeCallback = callback;
+}
+
 // In: none. Out: number of currently-populated directory entries.
 int MeshLayer::directoryCount() const {
     int count = 0;
@@ -279,9 +291,11 @@ int MeshLayer::routeCount() const {
 }
 
 // In: index - zero-based position among used entries only.
-// Out: outDest/outNextHop/outCost populated on success; returns true if index
-//      was valid, false if it's out of range.
-bool MeshLayer::routeEntryAt(int index, char& outDest, char& outNextHop, uint8_t& outCost) const {
+// Out: outDest/outNextHop/outCost/outAgeMs populated on success (outAgeMs is
+//      milliseconds since the entry was last refreshed); returns true if
+//      index was valid, false if it's out of range.
+bool MeshLayer::routeEntryAt(int index, char& outDest, char& outNextHop, uint8_t& outCost,
+                              unsigned long& outAgeMs) const {
     int count = 0;
     for (int i = 0; i < MESH_ROUTE_TABLE_SIZE; i++) {
         if (!_routes[i].used) continue;
@@ -289,6 +303,7 @@ bool MeshLayer::routeEntryAt(int index, char& outDest, char& outNextHop, uint8_t
             outDest    = _routes[i].destNode;
             outNextHop = _routes[i].nextHop;
             outCost    = _routes[i].cost;
+            outAgeMs   = millis() - _routes[i].lastUpdated;
             return true;
         }
         count++;
@@ -383,7 +398,10 @@ void MeshLayer::_expireDirectory() {
 // Out: none. Ignores routes to ourselves/broadcast. Updates the existing
 // entry for destNode if the new info is cheaper, refreshes the same next
 // hop, or the old entry is stale; otherwise inserts a new entry (evicting
-// the oldest if the table is full).
+// the oldest if the table is full). Fires the route callback only when the
+// next hop or cost actually changes value (or the entry is new) — a plain
+// timestamp refresh of an unchanged route does not fire it, so UI/BLE
+// listeners aren't spammed on every packet from an already-known neighbor.
 void MeshLayer::_learnRoute(char destNode, char viaNextHop, uint8_t cost) {
     if (destNode == _nodeId || destNode == NODE_BROADCAST) return;
 
@@ -391,13 +409,15 @@ void MeshLayer::_learnRoute(char destNode, char viaNextHop, uint8_t cost) {
 
     for (int i = 0; i < MESH_ROUTE_TABLE_SIZE; i++) {
         if (_routes[i].used && _routes[i].destNode == destNode) {
-            bool sameNextHop = _routes[i].nextHop == viaNextHop;
+            bool sameNextHop  = _routes[i].nextHop == viaNextHop;
             bool better       = cost < _routes[i].cost;
             bool stale        = (now - _routes[i].lastUpdated) > MESH_ROUTE_MAX_AGE_MS;
+            bool valueChanged = (_routes[i].nextHop != viaNextHop) || (_routes[i].cost != cost);
             if (sameNextHop || better || stale) {
                 _routes[i].nextHop     = viaNextHop;
                 _routes[i].cost        = cost;
                 _routes[i].lastUpdated = now;
+                if (valueChanged && _routeCallback) _routeCallback(destNode, viaNextHop, cost, false);
             }
             return;
         }
@@ -425,6 +445,7 @@ void MeshLayer::_learnRoute(char destNode, char viaNextHop, uint8_t cost) {
     _routes[slot].lastUpdated = now;
 
     Serial.printf("[Mesh] Route + dest %c via %c (cost %u)\n", destNode, viaNextHop, cost);
+    if (_routeCallback) _routeCallback(destNode, viaNextHop, cost, false);
 }
 
 // In: destNode - node to find a route to.
@@ -442,13 +463,16 @@ bool MeshLayer::_lookupRoute(char destNode, char& outNextHop) const {
 }
 
 // In: none. Out: none.
-// Drops routing table entries not refreshed within MESH_ROUTE_MAX_AGE_MS.
+// Drops routing table entries not refreshed within MESH_ROUTE_MAX_AGE_MS,
+// firing the route callback (removed=true) for each one dropped.
 void MeshLayer::_expireRoutes() {
     unsigned long now = millis();
     for (int i = 0; i < MESH_ROUTE_TABLE_SIZE; i++) {
         if (_routes[i].used && now - _routes[i].lastUpdated > MESH_ROUTE_MAX_AGE_MS) {
             Serial.printf("[Mesh] Route - dest %c (stale)\n", _routes[i].destNode);
+            char destNode = _routes[i].destNode;
             _routes[i].used = false;
+            if (_routeCallback) _routeCallback(destNode, 0, 0, true);
         }
     }
 }

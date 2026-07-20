@@ -114,6 +114,12 @@ typedef void (*MeshDirectoryCallback)();
 // Callback invoked when a chat message this node sent is acked or times out.
 typedef void (*MeshDeliveryCallback)(char destNode, uint8_t msgId, MeshDeliveryStatus status);
 
+// Callback invoked when the routing table gains/updates or loses an entry.
+// Fired only on substantive changes (new destination, changed next hop/cost,
+// or expiry) — not on every packet that merely refreshes a timestamp.
+// removed=true means destNode's entry was dropped (nextHop/cost are 0).
+typedef void (*MeshRouteCallback)(char destNode, char nextHop, uint8_t cost, bool removed);
+
 class MeshLayer {
 public:
     MeshLayer();
@@ -131,8 +137,12 @@ public:
     // Looks up nickname in the directory; if unknown, sends as broadcast so
     // it still has a chance to be picked up (and the directory to catch up).
     // Unicast sends (resolved nickname) are tracked for delivery ACK.
+    // outDestNode/outMsgId (if non-null) receive the resolved destination
+    // node and assigned sequence number, so a caller (e.g. main.cpp) can
+    // correlate a later delivery-status callback back to this specific send.
     // Returns false only on a hard local failure (radio error).
-    bool sendChat(const String& destNickname, const String& message);
+    bool sendChat(const String& destNickname, const String& message,
+                  char* outDestNode = nullptr, uint8_t* outMsgId = nullptr);
 
     // Called by lora.cpp when a raw packet is received off the radio.
     // Returns the action taken so callers (main.cpp) can decide what to log/show.
@@ -141,6 +151,7 @@ public:
     void onChatReceived(MeshChatCallback callback);
     void onDirectoryChanged(MeshDirectoryCallback callback);
     void onDeliveryStatus(MeshDeliveryCallback callback);
+    void onRouteChanged(MeshRouteCallback callback);
 
     // Directory introspection (for UI / debugging).
     int  directoryCount() const;
@@ -148,8 +159,11 @@ public:
     bool resolveNickname(const String& nickname, char& outNodeId) const;
 
     // Routing table introspection (for UI / debugging).
+    // outAgeMs is how long ago (in ms) the entry was last refreshed, for
+    // showing a fresh/stale indicator.
     int  routeCount() const;
-    bool routeEntryAt(int index, char& outDest, char& outNextHop, uint8_t& outCost) const;
+    bool routeEntryAt(int index, char& outDest, char& outNextHop, uint8_t& outCost,
+                       unsigned long& outAgeMs) const;
 
 private:
     char     _nodeId;
@@ -159,6 +173,7 @@ private:
     MeshChatCallback       _chatCallback;
     MeshDirectoryCallback  _directoryCallback;
     MeshDeliveryCallback   _deliveryCallback;
+    MeshRouteCallback      _routeCallback;
 
     DirectoryEntry _directory[MESH_DIRECTORY_SIZE];
     RouteEntry     _routes[MESH_ROUTE_TABLE_SIZE];

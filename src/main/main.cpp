@@ -10,7 +10,7 @@
 // Node ID is derived from the BLE device name suffix, e.g. "LastLink-A" -> 'A'.
 // To stand up another node, just change DEVICE_NAME below (or move it to
 // config.h if you want it per-build via build_flags).
-#define DEVICE_NAME "LastLink-C"
+#define DEVICE_NAME "LastLink-B"
 
 // In: deviceName - the BLE advertised name (e.g. "LastLink-A"). Out: the
 //     single-character node id parsed after the last '-', or the name's
@@ -27,19 +27,60 @@ static char deriveNodeId(const String& deviceName) {
 
 enum MsgSource { SRC_SERIAL, SRC_BLE };
 
+// Tracks the most recent unicast send so onMeshDeliveryStatus() can tell
+// whether an ack/timeout belongs to it (and is therefore worth a brief OLED
+// overlay) versus an older, already-superseded in-flight message.
+static char    g_lastSentDest    = 0;
+static uint8_t g_lastSentMsgId   = 0;
+static bool    g_lastSentPending = false;
+
+// In: none. Out: none.
+// Pushes a "[STATUS] node=<id> nick=<nickname>" line to the connected phone
+// so it always knows which node/nickname it's on. No-op if nothing's connected.
+void pushMeshStatus() {
+    if (!Ble.isConnected()) return;
+    Ble.send("[STATUS] node=" + String(Mesh.nodeId()) + " nick=" + Mesh.localNickname());
+}
+
+// In: none. Out: none.
+// Pushes a full "[ROUTES] dest:nextHop:cost:ageSeconds,..." dump of the
+// current routing table to the connected phone. Used once on BLE connect so
+// the app starts with complete state; subsequent changes travel as smaller
+// [ROUTE+]/[ROUTE-] deltas from onMeshRouteChanged(). No-op if not connected.
+void pushRouteDump() {
+    if (!Ble.isConnected()) return;
+
+    String msg = "[ROUTES] ";
+    int count = Mesh.routeCount();
+    for (int i = 0; i < count; i++) {
+        char          dest, nextHop;
+        uint8_t       cost;
+        unsigned long ageMs;
+        if (Mesh.routeEntryAt(i, dest, nextHop, cost, ageMs)) {
+            if (i > 0) msg += ",";
+            msg += String(dest) + ":" + String(nextHop) + ":" + String(cost) + ":" + String(ageMs / 1000);
+        }
+    }
+    Ble.send(msg);
+}
+
 // ─── Outgoing chat (typed locally over Serial, or relayed from this node's
 //     own phone) — addressed to a nickname, or broadcast if none given ──────
 // In: destNickname - target nickname (empty = broadcast); message - text to
 //     send; source - where the send originated (Serial or BLE), used for logging/UI.
-// Out: none. Drives the OLED send animation, calls Mesh.sendChat(), and logs/
-// displays success or failure.
+// Out: none. Drives the OLED send animation, calls Mesh.sendChat(), logs/
+// displays success or failure, and for unicast sends, tracks the assigned
+// msgId and pushes "[SENT]" so the phone can correlate a later ack.
 void sendChat(const String& destNickname, const String& message, MsgSource source) {
     String tag = (source == SRC_BLE) ? "BLE" : "SERIAL";
     String label = destNickname.length() ? (tag + "->" + destNickname) : tag;
 
-    Ui.showSending(message, label);
+    Ui.notifySending(message, label);
 
-    bool ok = Mesh.sendChat(destNickname, message);
+    char    destNode = NODE_BROADCAST;
+    uint8_t msgId    = 0;
+    bool ok = Mesh.sendChat(destNickname, message, &destNode, &msgId);
+
     if (ok) {
         Serial.println();
         Serial.println("┌─────────────────────────────────┐");
@@ -48,10 +89,19 @@ void sendChat(const String& destNickname, const String& message, MsgSource sourc
         Serial.println("└─────────────────────────────────┘");
         Serial.println();
 
-        Ui.showSendComplete(message, label);
+        Ui.notifySendComplete(message, label);
+
+        if (destNode != NODE_BROADCAST) {
+            g_lastSentDest    = destNode;
+            g_lastSentMsgId   = msgId;
+            g_lastSentPending = true;
+            if (Ble.isConnected()) {
+                Ble.send("[SENT] id=" + String(msgId) + " dest=" + String(destNode));
+            }
+        }
     } else {
         Serial.println("[LoRa] TX failed");
-        Ui.showSendFailed(message);
+        Ui.notifySendFailed(message);
     }
 }
 
@@ -79,6 +129,8 @@ void onSerialMessage(const String& line) {
     // own phone-facing nickname too, same as the phone would over BLE.
     if (line.startsWith("/nick ")) {
         Mesh.setLocalNickname(line.substring(6));
+        Ui.setIdentity(Mesh.nodeId(), Mesh.localNickname());
+        pushMeshStatus();
         Serial.println("[Mesh] Nickname set via Serial: " + line.substring(6));
         return;
     }
@@ -97,7 +149,9 @@ void onBleMessage(const String& message) {
         String nickname = message.substring(6);
         nickname.trim();
         Mesh.setLocalNickname(nickname);
+        Ui.setIdentity(Mesh.nodeId(), nickname);
         Ble.send("[OK] nickname set to " + nickname);
+        pushMeshStatus();
         return;
     }
 
@@ -109,20 +163,24 @@ void onBleMessage(const String& message) {
 
 // In: connected - new BLE connection state; deviceName - the connected
 //     device's name (unused when disconnected). Out: none.
-// Updates the OLED to show the connected or idle screen.
+// Fires the connected/disconnected OLED event, and on a fresh connection
+// pushes the phone its initial state (node identity + full routing table)
+// since it starts with no prior knowledge.
 void onBleConnectionChange(bool connected, const String& deviceName) {
     if (connected) {
-        Ui.showBleConnected(deviceName);
+        Ui.notifyBleConnected(deviceName);
+        pushMeshStatus();
+        pushRouteDump();
     } else {
-        Ui.showBleDisconnected();
+        Ui.notifyBleDisconnected();
     }
 }
 
 // ─── Incoming chat from the mesh, addressed to us or broadcast ─────────────
 // In: senderNickname - sender's nickname if known (empty otherwise); srcNode
 //     - sender's node id; message - the chat text. Out: none.
-// Logs the message, shows it on the OLED with signal stats, and forwards it
-// to the connected phone over BLE if one is present.
+// Logs the message, fires the OLED "message received" event (sender +
+// content), and forwards it to the connected phone over BLE if one is present.
 void onMeshChatReceived(const String& senderNickname, char srcNode, const String& message) {
     String from = senderNickname.length() ? senderNickname : String(srcNode);
 
@@ -133,7 +191,7 @@ void onMeshChatReceived(const String& senderNickname, char srcNode, const String
     Serial.println("└─────────────────────────────────┘");
     Serial.println();
 
-    Ui.showReceiveComplete(from + ": " + message, (int)radio.getRSSI(), radio.getSNR());
+    Ui.notifyMessageReceived(from, message);
 
     if (Ble.isConnected()) {
         Ble.send(from + ": " + message);
@@ -142,23 +200,46 @@ void onMeshChatReceived(const String& senderNickname, char srcNode, const String
 
 // In: destNode - node the original chat was sent to; msgId - its sequence
 //     number; status - MESH_DELIVERY_ACKED or MESH_DELIVERY_FAILED. Out: none.
-// Logs the outcome and, if a phone is connected, notifies it over BLE.
+// Logs the outcome, pushes a structured "[ACK]" line (tagged with msgId so
+// the phone can match it to the specific message it sent) over BLE, and — if
+// this is the most recently sent message — fires the OLED delivery-status event.
 void onMeshDeliveryStatus(char destNode, uint8_t msgId, MeshDeliveryStatus status) {
-    String label = (status == MESH_DELIVERY_ACKED) ? "Delivered" : "Failed";
-    Serial.printf("[Mesh] Msg %u to %c: %s\n", msgId, destNode, label.c_str());
+    bool delivered = (status == MESH_DELIVERY_ACKED);
+    String statusStr = delivered ? "delivered" : "failed";
+    Serial.printf("[Mesh] Msg %u to %c: %s\n", msgId, destNode, statusStr.c_str());
 
     if (Ble.isConnected()) {
-        Ble.send("[" + label + "] to " + String(destNode));
+        Ble.send("[ACK] id=" + String(msgId) + " dest=" + String(destNode) + " status=" + statusStr);
+    }
+
+    if (g_lastSentPending && destNode == g_lastSentDest && msgId == g_lastSentMsgId) {
+        g_lastSentPending = false;
+        Ui.notifyAckReceived(destNode, delivered);
     }
 }
 
 // In: none. Out: none.
-// Refreshes the OLED directory screen, but only when not mid-receive-animation.
+// Redraws the OLED Mesh screen if it's currently showing (no-op otherwise —
+// UiHandler decides that itself).
 void onMeshDirectoryChanged() {
-    // Only refresh the idle screen opportunistically — avoid interrupting an
-    // in-progress send/receive animation on the OLED.
-    if (!rxFlag) {
-        Ui.showMeshDirectory();
+    Ui.refreshMesh();
+}
+
+// In: destNode/nextHop/cost - the changed routing entry; removed - true if
+//     destNode's route was just dropped (nextHop/cost are meaningless then).
+// Out: none. Redraws the OLED Mesh screen if it's currently showing, and
+// pushes a compact delta ("[ROUTE+]"/"[ROUTE-]") to the phone — this only
+// fires on substantive table changes (see MeshLayer::_learnRoute), so it
+// doesn't spam either surface.
+void onMeshRouteChanged(char destNode, char nextHop, uint8_t cost, bool removed) {
+    Ui.refreshMesh();
+
+    if (Ble.isConnected()) {
+        if (removed) {
+            Ble.send("[ROUTE-] dest=" + String(destNode));
+        } else {
+            Ble.send("[ROUTE+] dest=" + String(destNode) + " via=" + String(nextHop) + " cost=" + String(cost));
+        }
     }
 }
 
@@ -192,6 +273,8 @@ void setup() {
     Mesh.onChatReceived(onMeshChatReceived);
     Mesh.onDirectoryChanged(onMeshDirectoryChanged);
     Mesh.onDeliveryStatus(onMeshDeliveryStatus);
+    Mesh.onRouteChanged(onMeshRouteChanged);
+    Ui.setIdentity(nodeId, "");
 
     Serial.println("─────────────────────────────────");
     Serial.println("  LastLink Firmware - Ready");
@@ -204,18 +287,20 @@ void setup() {
 }
 
 // In: none (Arduino main loop, called repeatedly). Out: none.
-// Polls the Serial/BLE/mesh handlers each tick, and when a radio packet has
-// arrived, reads it, hands it to Mesh.handleIncomingPacket(), logs the
-// resulting action, and re-arms the receiver.
+// Polls the Serial/BLE/mesh/UI handlers each tick, and when a radio packet
+// has arrived, reads it, hands it to Mesh.handleIncomingPacket(), logs the
+// resulting action, and re-arms the receiver. The OLED only reacts to
+// specific named events (chat-for-me, ack-for-me, etc. via their onMesh*
+// callbacks) — arbitrary radio activity (relays, presence, duplicates) is
+// intentionally not shown on-screen.
 void loop() {
     SerialInput.update();
     Ble.update();
     Mesh.update();
+    Ui.update();
 
     if (rxFlag) {
         rxFlag = false;
-
-        Ui.showReceiving();
 
         uint8_t buf[MESH_HEADER_LEN + MESH_MAX_PAYLOAD];
         size_t  len = sizeof(buf);
