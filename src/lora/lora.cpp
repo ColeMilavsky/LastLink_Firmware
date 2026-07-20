@@ -9,10 +9,16 @@ SX1262 radio = new Module(LORA_CS, LORA_DIO1, LORA_RST, LORA_BUSY, spi);
 
 volatile bool rxFlag = false;
 
+// In: none (radio interrupt handler). Out: none.
+// Sets rxFlag so the main loop knows to drain a received packet; kept
+// minimal since this runs in interrupt context.
 void IRAM_ATTR onReceive() {
     rxFlag = true;
 }
 
+// In: none. Out: RADIOLIB_ERR_NONE on success, or a RadioLib error code.
+// Initializes SPI and the SX1262 radio with this project's fixed link
+// parameters, wires up the receive interrupt, and starts listening.
 int loraBegin() {
     spi.begin(LORA_SCK, LORA_MISO, LORA_MOSI, LORA_CS);
 
@@ -43,6 +49,9 @@ int loraBegin() {
 }
 
 // ─── Send over LoRa (plain text — legacy path, kept for compatibility) ────────
+// In: message - plain text to transmit. Out: RadioLib transmit status code.
+// Legacy plain-text send path; briefly disables the RX interrupt during
+// transmit, then re-arms it and resumes listening.
 int loraSend(const String& message) {
     radio.clearDio1Action();
     String msg = message;
@@ -53,6 +62,10 @@ int loraSend(const String& message) {
 }
 
 // ─── Send over LoRa (raw bytes — used by the mesh packet framing) ────────────
+// In: data/len - raw bytes to transmit (a mesh packet). Out: RadioLib
+//     transmit status code.
+// Disables the RX interrupt during transmit, sends the raw bytes, then
+// re-arms the interrupt and resumes listening. Used for all mesh traffic.
 int loraSendRaw(const uint8_t* data, size_t len) {
     radio.clearDio1Action();
     int state = radio.transmit((uint8_t*)data, len);
@@ -61,10 +74,11 @@ int loraSendRaw(const uint8_t* data, size_t len) {
     return state;
 }
 
-// ─── Receive raw bytes off the radio ──────────────────────────────────────────
-// outLen (input) is the capacity of outBuf; on return it holds the actual
-// number of bytes received. Per RadioLib's API, getPacketLength() must be
-// called BEFORE readData() to know how much was actually received.
+// In: outBuf - caller-owned buffer; outLen (as input) - its capacity.
+// Out: outBuf filled with the received packet; outLen (as output) - actual
+//      bytes received; returns RADIOLIB_ERR_NONE on success or an error code.
+// Per RadioLib's API, getPacketLength() must be called BEFORE readData() to
+// know how much was actually received; truncates rather than overflowing outBuf.
 int loraReceiveRaw(uint8_t* outBuf, size_t& outLen) {
     size_t capacity = outLen;
     size_t received = radio.getPacketLength();
@@ -82,6 +96,8 @@ int loraReceiveRaw(uint8_t* outBuf, size_t& outLen) {
     return state;
 }
 
+// In: line - a line of text read from Serial. Out: none.
+// Sends the line over LoRa via the legacy plain-text path.
 void onSerialLine(const String& line) {
     loraSend(line);
 }

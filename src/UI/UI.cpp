@@ -11,8 +11,11 @@ static SSD1306Wire display(0x3c, OLED_SDA, OLED_SCL);
 
 UiHandler Ui;
 
+// In: none. Out: none. Constructs the handler with BLE shown as disconnected.
 UiHandler::UiHandler() : _bleConnected(false) {}
 
+// In: none. Out: none.
+// Resets and initializes the OLED display, then draws the idle screen.
 void UiHandler::begin() {
     pinMode(OLED_RST, OUTPUT);
     digitalWrite(OLED_RST, LOW);
@@ -26,10 +29,14 @@ void UiHandler::begin() {
     showIdle();
 }
 
+// In: none. Out: none. Reserved for future use (nothing to poll today).
 void UiHandler::update() {
     // Reserved for future use
 }
 
+// In: label - text shown next to the direction arrow; sending - true for a
+//     TX screen (">>"), false for RX ("<<"). Out: none.
+// Clears the display and draws the shared header bar used by the send/receive screens.
 void UiHandler::_drawHeader(const char* label, bool sending) {
     display.clear();
     display.setFont(ArialMT_Plain_10);
@@ -40,6 +47,9 @@ void UiHandler::_drawHeader(const char* label, bool sending) {
     display.drawLine(0, 12, 128, 12);
 }
 
+// In: text - message to display; startY - vertical pixel offset to start at.
+// Out: none. Word-wraps text to the OLED's character width, draws each line
+// (stopping once it runs off the bottom of the screen), then flushes to the display.
 void UiHandler::_wrapAndPrint(const String& text, int startY) {
     const int maxCharsPerLine = 21;
     const int lineHeight = 12;
@@ -66,6 +76,8 @@ void UiHandler::_wrapAndPrint(const String& text, int startY) {
     display.display();
 }
 
+// In: deviceName - name of the connected phone/device. Out: none.
+// Marks BLE as connected and draws the "Phone Connected" screen.
 void UiHandler::showBleConnected(const String& deviceName) {
     _bleConnected = true;
     _lastBleDevice = deviceName;
@@ -79,11 +91,15 @@ void UiHandler::showBleConnected(const String& deviceName) {
     display.display();
 }
 
+// In: none. Out: none. Marks BLE as disconnected and falls back to the idle screen.
 void UiHandler::showBleDisconnected() {
     _bleConnected = false;
     showIdle();
 }
 
+// In: message - text being sent; source - label describing where it's going
+//     (e.g. a nickname or "BLE"/"SERIAL"). Out: none.
+// Draws the "SENDING..." screen with the message body.
 void UiHandler::showSending(const String& message, const String& source) {
     _drawHeader("SENDING...", true);
     display.setFont(ArialMT_Plain_10);
@@ -91,6 +107,8 @@ void UiHandler::showSending(const String& message, const String& source) {
     _wrapAndPrint(message, 28);
 }
 
+// In: message - text that was sent; source - label describing where it went.
+// Out: none. Draws the "SENT" confirmation screen.
 void UiHandler::showSendComplete(const String& message, const String& source) {
     _drawHeader("SENT", true);
     display.setFont(ArialMT_Plain_10);
@@ -98,17 +116,22 @@ void UiHandler::showSendComplete(const String& message, const String& source) {
     _wrapAndPrint(message, 28);
 }
 
+// In: message - text that failed to send. Out: none.
+// Draws the "SEND FAILED" screen.
 void UiHandler::showSendFailed(const String& message) {
     _drawHeader("SEND FAILED", true);
     display.setFont(ArialMT_Plain_10);
     _wrapAndPrint(message, 16);
 }
 
+// In: none. Out: none. Draws the "RECEIVING..." screen.
 void UiHandler::showReceiving() {
     _drawHeader("RECEIVING...", false);
     display.display();
 }
 
+// In: message - received text; rssi/snr - signal quality of the reception.
+// Out: none. Draws the "RECEIVED" screen with signal stats and the message body.
 void UiHandler::showReceiveComplete(const String& message, int rssi, float snr) {
     _drawHeader("RECEIVED", false);
     display.setFont(ArialMT_Plain_10);
@@ -120,6 +143,8 @@ void UiHandler::showReceiveComplete(const String& message, int rssi, float snr) 
     _wrapAndPrint(message, 28);
 }
 
+// In: none. Out: none.
+// Draws the idle/ready screen, showing BLE connection state.
 void UiHandler::showIdle() {
     display.clear();
     display.setFont(ArialMT_Plain_16);
@@ -130,6 +155,9 @@ void UiHandler::showIdle() {
     display.display();
 }
 
+// In: none. Out: none.
+// Draws the known nickname directory (node id -> nickname, marking our own
+// entry), pulling current entries from the global Mesh instance.
 void UiHandler::showMeshDirectory() {
     display.clear();
     display.setFont(ArialMT_Plain_10);

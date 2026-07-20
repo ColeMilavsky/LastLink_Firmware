@@ -10,8 +10,11 @@
 // Node ID is derived from the BLE device name suffix, e.g. "LastLink-A" -> 'A'.
 // To stand up another node, just change DEVICE_NAME below (or move it to
 // config.h if you want it per-build via build_flags).
-#define DEVICE_NAME "LastLink-A"
+#define DEVICE_NAME "LastLink-C"
 
+// In: deviceName - the BLE advertised name (e.g. "LastLink-A"). Out: the
+//     single-character node id parsed after the last '-', or the name's
+//     last character if there's no dash.
 static char deriveNodeId(const String& deviceName) {
     int dash = deviceName.lastIndexOf('-');
     if (dash >= 0 && dash + 1 < (int)deviceName.length()) {
@@ -26,6 +29,10 @@ enum MsgSource { SRC_SERIAL, SRC_BLE };
 
 // ─── Outgoing chat (typed locally over Serial, or relayed from this node's
 //     own phone) — addressed to a nickname, or broadcast if none given ──────
+// In: destNickname - target nickname (empty = broadcast); message - text to
+//     send; source - where the send originated (Serial or BLE), used for logging/UI.
+// Out: none. Drives the OLED send animation, calls Mesh.sendChat(), and logs/
+// displays success or failure.
 void sendChat(const String& destNickname, const String& message, MsgSource source) {
     String tag = (source == SRC_BLE) ? "BLE" : "SERIAL";
     String label = destNickname.length() ? (tag + "->" + destNickname) : tag;
@@ -48,8 +55,9 @@ void sendChat(const String& destNickname, const String& message, MsgSource sourc
     }
 }
 
-// Parses "@nickname message text" -> destNickname="nickname", message="message text".
-// If there's no leading '@', destNickname is left empty (broadcast).
+// In: line - raw input, optionally in "@nickname message text" form.
+// Out: destNickname/message split from line; destNickname is left empty
+//      (meaning broadcast) if there's no leading '@'.
 static void parseAddressedMessage(const String& line, String& destNickname, String& message) {
     destNickname = "";
     message = line;
@@ -63,6 +71,9 @@ static void parseAddressedMessage(const String& line, String& destNickname, Stri
     }
 }
 
+// In: line - a complete line typed over Serial. Out: none.
+// Handles the local "/nick" convenience command, otherwise parses it as an
+// addressed or broadcast chat message and sends it.
 void onSerialMessage(const String& line) {
     // Local debug convenience: typing "/nick Foo" on Serial sets this node's
     // own phone-facing nickname too, same as the phone would over BLE.
@@ -77,6 +88,9 @@ void onSerialMessage(const String& line) {
     sendChat(destNickname, message, SRC_SERIAL);
 }
 
+// In: message - raw text written by the connected phone. Out: none.
+// Handles the "/nick" registration command (acking over BLE), otherwise
+// parses it as an addressed or broadcast chat message and sends it.
 void onBleMessage(const String& message) {
     // Phone registers/changes its nickname with "/nick Foo".
     if (message.startsWith("/nick ")) {
@@ -93,6 +107,9 @@ void onBleMessage(const String& message) {
     sendChat(destNickname, chatMessage, SRC_BLE);
 }
 
+// In: connected - new BLE connection state; deviceName - the connected
+//     device's name (unused when disconnected). Out: none.
+// Updates the OLED to show the connected or idle screen.
 void onBleConnectionChange(bool connected, const String& deviceName) {
     if (connected) {
         Ui.showBleConnected(deviceName);
@@ -102,6 +119,10 @@ void onBleConnectionChange(bool connected, const String& deviceName) {
 }
 
 // ─── Incoming chat from the mesh, addressed to us or broadcast ─────────────
+// In: senderNickname - sender's nickname if known (empty otherwise); srcNode
+//     - sender's node id; message - the chat text. Out: none.
+// Logs the message, shows it on the OLED with signal stats, and forwards it
+// to the connected phone over BLE if one is present.
 void onMeshChatReceived(const String& senderNickname, char srcNode, const String& message) {
     String from = senderNickname.length() ? senderNickname : String(srcNode);
 
@@ -119,6 +140,20 @@ void onMeshChatReceived(const String& senderNickname, char srcNode, const String
     }
 }
 
+// In: destNode - node the original chat was sent to; msgId - its sequence
+//     number; status - MESH_DELIVERY_ACKED or MESH_DELIVERY_FAILED. Out: none.
+// Logs the outcome and, if a phone is connected, notifies it over BLE.
+void onMeshDeliveryStatus(char destNode, uint8_t msgId, MeshDeliveryStatus status) {
+    String label = (status == MESH_DELIVERY_ACKED) ? "Delivered" : "Failed";
+    Serial.printf("[Mesh] Msg %u to %c: %s\n", msgId, destNode, label.c_str());
+
+    if (Ble.isConnected()) {
+        Ble.send("[" + label + "] to " + String(destNode));
+    }
+}
+
+// In: none. Out: none.
+// Refreshes the OLED directory screen, but only when not mid-receive-animation.
 void onMeshDirectoryChanged() {
     // Only refresh the idle screen opportunistically — avoid interrupting an
     // in-progress send/receive animation on the OLED.
@@ -127,6 +162,9 @@ void onMeshDirectoryChanged() {
     }
 }
 
+// In: none (Arduino entry point, called once at boot). Out: none.
+// Brings up Serial, the OLED, the LoRa radio, the Serial-line handler, BLE,
+// and the mesh layer, wiring each one's callbacks before printing the ready banner.
 void setup() {
     Serial.begin(115200);
     delay(2000);
@@ -153,6 +191,7 @@ void setup() {
     Mesh.begin(nodeId);
     Mesh.onChatReceived(onMeshChatReceived);
     Mesh.onDirectoryChanged(onMeshDirectoryChanged);
+    Mesh.onDeliveryStatus(onMeshDeliveryStatus);
 
     Serial.println("─────────────────────────────────");
     Serial.println("  LastLink Firmware - Ready");
@@ -164,6 +203,10 @@ void setup() {
     Serial.println("─────────────────────────────────");
 }
 
+// In: none (Arduino main loop, called repeatedly). Out: none.
+// Polls the Serial/BLE/mesh handlers each tick, and when a radio packet has
+// arrived, reads it, hands it to Mesh.handleIncomingPacket(), logs the
+// resulting action, and re-arms the receiver.
 void loop() {
     SerialInput.update();
     Ble.update();
@@ -193,6 +236,9 @@ void loop() {
                     break;
                 case MESH_RX_PRESENCE:
                     Serial.println("[Mesh] Presence beacon received/relayed");
+                    break;
+                case MESH_RX_ACK:
+                    Serial.println("[Mesh] Ack packet received/relayed");
                     break;
                 case MESH_RX_DUPLICATE:
                     Serial.println("[Mesh] Duplicate packet dropped");

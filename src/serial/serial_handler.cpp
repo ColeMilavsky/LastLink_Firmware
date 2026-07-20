@@ -3,8 +3,11 @@
 
 SerialHandler SerialInput;
 
+// In: none. Out: none. Constructs the handler with no line callback registered.
 SerialHandler::SerialHandler() : _lineCallback(nullptr) {}
 
+// In: none. Out: none.
+// Starts the Serial port at SERIAL_BAUD and waits briefly for USB CDC to enumerate.
 void SerialHandler::begin() {
     Serial.begin(SERIAL_BAUD);
     // Wait for USB CDC to connect
@@ -15,10 +18,16 @@ void SerialHandler::begin() {
     Serial.println("[Serial] Ready. Type a message and press Enter to send over LoRa.");
 }
 
+// In: callback - function to invoke with each complete line typed over Serial.
+// Out: none.
 void SerialHandler::onLine(SerialLineCallback callback) {
     _lineCallback = callback;
 }
 
+// In: none. Out: none.
+// Drains available Serial bytes into a line buffer, handling backspace/DEL
+// and \r\n, and fires the line callback once a newline-terminated,
+// non-empty line has accumulated.
 void SerialHandler::update() {
     while (Serial.available()) {
         char c = Serial.read();
