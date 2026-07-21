@@ -18,7 +18,8 @@ UiHandler Ui;
 // SCREEN_HOME once the display is ready.
 UiHandler::UiHandler()
     : _screen(SCREEN_HOME), _screenExpiresAt(0), _nodeId(0),
-      _meshPage(0), _lastMeshPageChange(0), _ackDestNode(0), _ackDelivered(false) {}
+      _meshPage(0), _lastMeshPageChange(0), _ackDestNode(0), _ackDelivered(false),
+      _ackElapsedMs(0) {}
 
 // In: none. Out: none.
 // Enables the Heltec V3's Vext power rail (GPIO36, active-low) that feeds
@@ -151,13 +152,16 @@ void UiHandler::notifyMessageReceived(const String& from, const String& message)
 }
 
 // In: destNode - node the original chat was sent to; delivered - true if
-//     acked, false if it timed out. Out: none.
+//     acked, false if it timed out; elapsedMs - round-trip send-to-ack time
+//     in milliseconds, only meaningful (and only ever shown) when delivered
+//     is true. Out: none.
 // Fires the "delivery status" event: interrupts whatever is currently
 // showing immediately and displays for UI_ACK_SCREEN_MS before update()
 // returns to Mesh.
-void UiHandler::notifyAckReceived(char destNode, bool delivered) {
-    _ackDestNode = destNode;
-    _ackDelivered = delivered;
+void UiHandler::notifyAckReceived(char destNode, bool delivered, unsigned long elapsedMs) {
+    _ackDestNode   = destNode;
+    _ackDelivered  = delivered;
+    _ackElapsedMs  = elapsedMs;
     _screen = SCREEN_ACK;
     _screenExpiresAt = millis() + UI_ACK_SCREEN_MS;
     _render();
@@ -294,9 +298,10 @@ void UiHandler::_renderHome() {
 // In: none. Out: none.
 // Draws the current Mesh-screen page: the routing table's pages first
 // (destination > next hop, cost, age), then the known-nodes directory's
-// pages, cycling back to the start — this is the persistent resting state
-// every timed event returns to. Page count is (re)computed from live Mesh
-// data each call, so it self-corrects if entries were added/removed since
+// pages (nodeId: nickname, plus "Xs ago" once a node has missed at least one
+// heartbeat interval), cycling back to the start — this is the persistent
+// resting state every timed event returns to. Page count is (re)computed
+// from live Mesh data each call, so it self-corrects if entries were added/removed since
 // the last render.
 void UiHandler::_renderMesh() {
     display.clear();
@@ -342,11 +347,17 @@ void UiHandler::_renderMesh() {
             int start = dirPage * UI_NODES_PER_PAGE;
             int y = 16;
             for (int i = start; i < dirCount && i < start + UI_NODES_PER_PAGE; i++) {
-                char   nodeId;
-                String nickname;
-                if (Mesh.directoryEntryAt(i, nodeId, nickname)) {
+                char          nodeId;
+                String        nickname;
+                unsigned long ageMs;
+                if (Mesh.directoryEntryAt(i, nodeId, nickname, ageMs)) {
                     String line = String(nodeId) + ": " + nickname;
-                    if (nodeId == Mesh.nodeId()) line += " (me)";
+                    if (nodeId == Mesh.nodeId()) {
+                        line += " (me)";
+                    } else if (ageMs > MESH_PRESENCE_INTERVAL_MS) {
+                        // Missed at least one expected heartbeat — show how long ago it was last heard.
+                        line += " " + String(ageMs / 1000) + "s ago";
+                    }
                     display.drawString(0, y, line);
                     y += 12;
                 }
@@ -376,8 +387,9 @@ void UiHandler::_renderMessage() {
 }
 
 // In: none. Out: none.
-// Draws the delivery-confirmation screen: a large DELIVERED/FAILED label
-// plus which node it was to/from.
+// Draws the delivery-confirmation screen: a large DELIVERED/FAILED label,
+// which node it was to/from, and — only for a real delivery, never a
+// timeout — the round-trip time in milliseconds.
 void UiHandler::_renderAck() {
     display.clear();
     display.setFont(ArialMT_Plain_16);
@@ -387,6 +399,10 @@ void UiHandler::_renderAck() {
     String line = "to ";
     line += _ackDestNode;
     display.drawString(0, 32, line);
+
+    if (_ackDelivered) {
+        display.drawString(0, 44, "in " + String(_ackElapsedMs) + "ms");
+    }
 
     _drawStatusBar();
     display.display();

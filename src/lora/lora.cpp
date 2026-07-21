@@ -30,7 +30,7 @@ int loraBegin() {
 
     radio.setFrequency(915.0);
     radio.setBandwidth(125.0);
-    radio.setSpreadingFactor(7);
+    radio.setSpreadingFactor(9);
     radio.setCodingRate(5);
     radio.setSyncWord(0x34);
     radio.setOutputPower(20);

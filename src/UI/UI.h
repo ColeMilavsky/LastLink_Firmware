@@ -49,7 +49,11 @@ public:
     void notifySendFailed(const String& message);
 
     void notifyMessageReceived(const String& from, const String& message);
-    void notifyAckReceived(char destNode, bool delivered);
+
+    // elapsedMs is the round-trip send-to-ack time in milliseconds; only
+    // shown/meaningful when delivered is true — pass 0 for a timeout, it is
+    // never displayed in that case.
+    void notifyAckReceived(char destNode, bool delivered, unsigned long elapsedMs = 0);
 
     // Redraws the Mesh screen (routing table + known nodes) in place if it's
     // currently showing; no-op otherwise (the data is pulled live from Mesh
@@ -80,6 +84,7 @@ private:
     String _msgFrom, _msgText;
     char   _ackDestNode;
     bool   _ackDelivered;
+    unsigned long _ackElapsedMs; // round-trip time, only valid/shown when _ackDelivered
     String _sendMessage, _sendSource;
     String _lastBleDevice;
 

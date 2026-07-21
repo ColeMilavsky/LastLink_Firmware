@@ -49,12 +49,28 @@
 #define MESH_DEFAULT_TTL     6        // max hops before a packet is dropped
 #define MESH_SEEN_CACHE_SIZE 32       // recently seen (srcNode,msgId) pairs
 #define MESH_PRESENCE_INTERVAL_MS 30000UL
-#define MESH_DIRECTORY_MAX_AGE_MS 120000UL // drop stale directory entries
+// A node is considered dead after missing two consecutive heartbeats
+// (~60s at the current interval), plus a small grace margin so ordinary
+// scheduling/relay jitter doesn't evict a node that's only barely late.
+#define MESH_NODE_TIMEOUT_MS (2 * MESH_PRESENCE_INTERVAL_MS + 5000UL)
 #define MESH_DIRECTORY_SIZE  16
 #define MESH_ROUTE_TABLE_SIZE 16
 #define MESH_ROUTE_MAX_AGE_MS 120000UL     // route considered stale/replaceable
+// A cheaper alternate next hop must be independently observed this many
+// times before an active (non-stale) route actually switches to it — a
+// single marginal/one-off reception (e.g. an occasional direct link that
+// isn't really reliable) shouldn't be enough to shortcut a route away from
+// an already-working multi-hop path. Does not apply to brand-new
+// destinations or to replacing an already-stale entry — only to displacing
+// a route that's currently active via a different next hop.
+#define MESH_ROUTE_CONFIRM_COUNT 2
 #define MESH_PENDING_ACK_SIZE 8
-#define MESH_ACK_TIMEOUT_MS   15000UL      // how long to wait for an ACK before "failed"
+#define MESH_ACK_TIMEOUT_MS   15000UL      // absolute ceiling on an in-flight send, regardless of retry math
+// Resend cadence scales with hop count: hopCount * this. When no route is
+// known yet at send time, hop count defaults to MESH_DEFAULT_TTL (worst
+// case) rather than assuming a fast direct link — see sendChat().
+#define MESH_RETRY_INTERVAL_PER_HOP_MS 500UL
+#define MESH_MAX_RETRIES 10                 // total attempts = 1 original send + this many retries
 
 enum MeshMsgType : uint8_t {
     MSG_CHAT     = 0x01,
@@ -93,14 +109,29 @@ struct RouteEntry {
     char     nextHop       = 0;
     uint8_t  cost          = 0; // hop count to destNode
     unsigned long lastUpdated = 0;
+
+    // Staging area for a cheaper candidate next hop that hasn't yet been
+    // corroborated enough times to actually replace the active route — see
+    // MeshLayer::_learnRoute().
+    char    candidateNextHop = 0;
+    uint8_t candidateCost    = 0;
+    uint8_t candidateSeen    = 0;
 };
 
-// One in-flight chat message awaiting (or having received) an ACK.
+// One in-flight chat message awaiting (or having received) an ACK. Doubles
+// as the retry-tracking record: the same packet (same msgId, so the
+// destination's dedup cache recognizes redundant copies) is retransmitted
+// on an interval until acked, retries are exhausted, or the absolute
+// timeout ceiling is hit.
 struct PendingAck {
-    bool          used     = false;
-    char          destNode = 0;
-    uint8_t       msgId    = 0;
-    unsigned long sentAt   = 0;
+    bool          used            = false;
+    char          destNode        = 0;
+    uint8_t       msgId           = 0;
+    unsigned long sentAt          = 0; // original send time — for round-trip-time reporting and the absolute timeout ceiling
+    unsigned long lastSentAt      = 0; // time of the most recent (re)transmission — gates the next retry
+    unsigned long retryIntervalMs = 0; // resend cadence for this message, frozen at send time (hopCount * MESH_RETRY_INTERVAL_PER_HOP_MS)
+    uint8_t       retryCount      = 0; // retries sent so far (0 = only the original send)
+    String        message;            // original chat text, so a retry can rebuild an identical packet with a freshly-looked-up next hop
 };
 
 // Callback invoked when a chat packet addressed to this node arrives.
@@ -112,7 +143,10 @@ typedef void (*MeshChatCallback)(const String& senderNickname, char srcNode, con
 typedef void (*MeshDirectoryCallback)();
 
 // Callback invoked when a chat message this node sent is acked or times out.
-typedef void (*MeshDeliveryCallback)(char destNode, uint8_t msgId, MeshDeliveryStatus status);
+// elapsedMs is the round-trip time in milliseconds from send to ack — only
+// meaningful when status==MESH_DELIVERY_ACKED; it is always 0 for
+// MESH_DELIVERY_FAILED, since a timeout has no real round trip to report.
+typedef void (*MeshDeliveryCallback)(char destNode, uint8_t msgId, MeshDeliveryStatus status, unsigned long elapsedMs);
 
 // Callback invoked when the routing table gains/updates or loses an entry.
 // Fired only on substantive changes (new destination, changed next hop/cost,
@@ -154,8 +188,10 @@ public:
     void onRouteChanged(MeshRouteCallback callback);
 
     // Directory introspection (for UI / debugging).
+    // outAgeMs is how long ago (in ms) this node's last heartbeat was heard,
+    // for showing a "missed a beacon" indicator once it exceeds one interval.
     int  directoryCount() const;
-    bool directoryEntryAt(int index, char& outNodeId, String& outNickname) const;
+    bool directoryEntryAt(int index, char& outNodeId, String& outNickname, unsigned long& outAgeMs) const;
     bool resolveNickname(const String& nickname, char& outNodeId) const;
 
     // Routing table introspection (for UI / debugging).
@@ -179,28 +215,49 @@ private:
     RouteEntry     _routes[MESH_ROUTE_TABLE_SIZE];
     PendingAck     _pendingAcks[MESH_PENDING_ACK_SIZE];
 
-    // Dedup cache of recently seen (srcNode, msgId) pairs.
-    struct SeenEntry { bool used = false; char srcNode = 0; uint8_t msgId = 0; };
+    // Dedup cache of recently seen (msgType, srcNode, msgId) triples. msgType
+    // is part of the key so a chat and an ack (or any other type) from the
+    // same node reusing the same sequence number are never mistaken for each
+    // other — a node's _nextMsgId counter is shared across every packet type
+    // it sends, so the type alone can't be inferred from srcNode+msgId.
+    struct SeenEntry { bool used = false; uint8_t msgType = 0; char srcNode = 0; uint8_t msgId = 0; };
     SeenEntry _seenCache[MESH_SEEN_CACHE_SIZE];
     uint8_t   _seenCacheIndex;
 
     unsigned long _lastPresenceBroadcast;
 
-    bool _wasRecentlySeen(char srcNode, uint8_t msgId);
-    void _markSeen(char srcNode, uint8_t msgId);
+    bool _wasRecentlySeen(uint8_t msgType, char srcNode, uint8_t msgId);
+    void _markSeen(uint8_t msgType, char srcNode, uint8_t msgId);
 
     void _updateDirectory(char nodeId, const String& nickname);
     void _expireDirectory();
 
+    // Drops any routing table entry that leads to or through a node that
+    // just timed out — called from _expireDirectory() on eviction.
+    void _purgeRoutesForNode(char deadNode);
+
     // Learns routes from any received packet: prevHop as a direct 1-hop
     // neighbor, and srcNode as reachable via prevHop at the derived cost.
     void _learnRoute(char destNode, char viaNextHop, uint8_t cost);
-    bool _lookupRoute(char destNode, char& outNextHop) const;
+    // outCost (if non-null) receives the route's hop count — used by
+    // sendChat() to scale the retry interval to hop count.
+    bool _lookupRoute(char destNode, char& outNextHop, uint8_t* outCost = nullptr) const;
     void _expireRoutes();
 
-    void _addPendingAck(char destNode, uint8_t msgId);
+    void _addPendingAck(char destNode, uint8_t msgId, const String& message, unsigned long retryIntervalMs);
     void _resolvePendingAck(char destNode, uint8_t msgId);
-    void _expirePendingAcks();
+
+    // Called every update(): retransmits any in-flight send whose retry
+    // interval has elapsed (up to MESH_MAX_RETRIES times), or fails it once
+    // retries are exhausted or the absolute MESH_ACK_TIMEOUT_MS ceiling hits.
+    void _servicePendingAcks();
+
+    // Rebuilds and resends a pending send's packet — same msgId (so the
+    // destination's dedup cache recognizes and drops the extra copy if the
+    // original already arrived), fresh ttl, and a freshly-looked-up next hop
+    // in case routing has changed since the message was first sent.
+    void _retransmitChat(const PendingAck& pending);
+
     void _sendAck(char toNode, uint8_t ackedMsgId);
 
     void _broadcastPresence();

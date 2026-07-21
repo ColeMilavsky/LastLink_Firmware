@@ -36,7 +36,7 @@ void MeshLayer::update() {
 
     _expireDirectory();
     _expireRoutes();
-    _expirePendingAcks();
+    _servicePendingAcks();
 }
 
 // In: nickname - the phone-supplied display name for this node. Out: none.
@@ -59,7 +59,9 @@ void MeshLayer::setLocalNickname(const String& nickname) {
 // Out: true if the radio accepted the transmission, false on a hard radio error.
 // Resolves the nickname to a node id and next hop (if a route is known),
 // builds and sends a MSG_CHAT packet, and registers a pending ACK for
-// unicast sends so delivery status can be reported later.
+// unicast sends — including the retry interval (hop count * 500ms, or a
+// worst-case 6-hop assumption if no route is known yet) — so it gets
+// retransmitted until acked, retried out, or timed out.
 bool MeshLayer::sendChat(const String& destNickname, const String& message,
                           char* outDestNode, uint8_t* outMsgId) {
     char destNode = NODE_BROADCAST;
@@ -72,10 +74,19 @@ bool MeshLayer::sendChat(const String& destNickname, const String& message,
 
     // Prefer a known route; falls back to NODE_BROADCAST (flood) if we don't
     // have one yet, or if the destination is a broadcast in the first place.
-    char chosenNextHop = NODE_BROADCAST;
+    // hopCount defaults to the full TTL budget (worst case) when no route is
+    // known — a flood delivery can legitimately take longer to complete than
+    // a known direct route, and retrying too aggressively before it's had a
+    // chance to succeed just wastes airtime.
+    char    chosenNextHop = NODE_BROADCAST;
+    uint8_t hopCount = MESH_DEFAULT_TTL;
     if (destNode != NODE_BROADCAST) {
-        _lookupRoute(destNode, chosenNextHop);
+        uint8_t routeCost = 0;
+        if (_lookupRoute(destNode, chosenNextHop, &routeCost)) {
+            hopCount = routeCost;
+        }
     }
+    if (hopCount == 0) hopCount = 1; // defensive floor — never a zero-length retry interval
 
     uint8_t packet[MESH_HEADER_LEN + MESH_MAX_PAYLOAD];
     size_t  packetLen = 0;
@@ -85,11 +96,12 @@ bool MeshLayer::sendChat(const String& destNickname, const String& message,
 
     // Remember our own (srcNode,msgId) so if this packet echoes back to us
     // via a relay loop we drop it instead of re-processing it.
-    _markSeen(_nodeId, msgId);
+    _markSeen(MSG_CHAT, _nodeId, msgId);
 
     // Only unicast sends expect an ACK — there's no single "delivered" for a broadcast.
     if (destNode != NODE_BROADCAST) {
-        _addPendingAck(destNode, msgId);
+        unsigned long retryIntervalMs = (unsigned long)hopCount * MESH_RETRY_INTERVAL_PER_HOP_MS;
+        _addPendingAck(destNode, msgId, message, retryIntervalMs);
     }
 
     if (outDestNode) *outDestNode = destNode;
@@ -102,11 +114,13 @@ bool MeshLayer::sendChat(const String& destNickname, const String& message,
 // In: data/len - raw packet bytes off the radio; rssi/snr - signal quality
 //     of the reception (currently unused here, available for future logging).
 // Out: the MeshRxAction describing what was done with the packet.
-// Parses the header, drops duplicates/malformed/self-echo packets, learns
-// routing-table entries from prevHop/srcNode, then dispatches by msgType:
-// updates the directory (presence), resolves a pending ack (ack), or
-// delivers/acks/relays a chat message — relaying only if this node is the
-// elected next hop or no route was known yet (flood fallback).
+// Parses the header, drops malformed/self-echo packets; a recognized
+// duplicate chat addressed to us gets its ack re-sent (in case the original
+// ack was lost, not the chat) before being dropped, since sends now retry.
+// Learns routing-table entries from prevHop/srcNode, then dispatches by
+// msgType: updates the directory (presence), resolves a pending ack (ack),
+// or delivers/acks/relays a chat message — relaying only if this node is
+// the elected next hop or no route was known yet (flood fallback).
 MeshRxAction MeshLayer::handleIncomingPacket(const uint8_t* data, size_t len, int rssi, float snr) {
     if (len < MESH_HEADER_LEN) {
         return MESH_RX_DUPLICATE; // malformed, treat as noise
@@ -130,10 +144,19 @@ MeshRxAction MeshLayer::handleIncomingPacket(const uint8_t* data, size_t len, in
         return MESH_RX_DUPLICATE;
     }
 
-    if (_wasRecentlySeen(srcNode, msgId)) {
+    if (_wasRecentlySeen(msgType, srcNode, msgId)) {
+        // A retried copy of a chat we've already delivered usually means our
+        // original ack was the thing lost in transit, not the chat — re-send
+        // it so the sender's retry can still succeed instead of eventually
+        // giving up on a message that actually arrived. Only for chat
+        // addressed specifically to us (broadcasts have no single ack to
+        // resend); we don't re-deliver to the phone or re-relay, just re-ack.
+        if (msgType == MSG_CHAT && dstNode == _nodeId) {
+            _sendAck(srcNode, msgId);
+        }
         return MESH_RX_DUPLICATE;
     }
-    _markSeen(srcNode, msgId);
+    _markSeen(msgType, srcNode, msgId);
 
     // Learn routes from this packet regardless of type or whether it's for
     // us — prevHop is always a direct neighbor, and srcNode is reachable
@@ -252,15 +275,17 @@ int MeshLayer::directoryCount() const {
 }
 
 // In: index - zero-based position among used entries only.
-// Out: outNodeId/outNickname populated on success; returns true if index was
-//      valid, false if it's out of range (fewer entries than requested).
-bool MeshLayer::directoryEntryAt(int index, char& outNodeId, String& outNickname) const {
+// Out: outNodeId/outNickname/outAgeMs populated on success (outAgeMs is
+//      milliseconds since this node's last heartbeat); returns true if index
+//      was valid, false if it's out of range (fewer entries than requested).
+bool MeshLayer::directoryEntryAt(int index, char& outNodeId, String& outNickname, unsigned long& outAgeMs) const {
     int count = 0;
     for (int i = 0; i < MESH_DIRECTORY_SIZE; i++) {
         if (!_directory[i].used) continue;
         if (count == index) {
             outNodeId   = _directory[i].nodeId;
             outNickname = _directory[i].nickname;
+            outAgeMs    = millis() - _directory[i].lastSeen;
             return true;
         }
         count++;
@@ -313,21 +338,26 @@ bool MeshLayer::routeEntryAt(int index, char& outDest, char& outNextHop, uint8_t
 
 // ─── Internal helpers ──────────────────────────────────────────────────────
 
-// In: srcNode/msgId - the (source, sequence number) pair identifying a packet.
-// Out: true if that pair is in the recent-seen cache (i.e. a duplicate).
-bool MeshLayer::_wasRecentlySeen(char srcNode, uint8_t msgId) {
+// In: msgType/srcNode/msgId - the (type, source, sequence number) triple
+//     identifying a packet.
+// Out: true if that triple is in the recent-seen cache (i.e. a duplicate of
+//      a packet of the same type from the same source).
+bool MeshLayer::_wasRecentlySeen(uint8_t msgType, char srcNode, uint8_t msgId) {
     for (int i = 0; i < MESH_SEEN_CACHE_SIZE; i++) {
-        if (_seenCache[i].used && _seenCache[i].srcNode == srcNode && _seenCache[i].msgId == msgId) {
+        if (_seenCache[i].used && _seenCache[i].msgType == msgType &&
+            _seenCache[i].srcNode == srcNode && _seenCache[i].msgId == msgId) {
             return true;
         }
     }
     return false;
 }
 
-// In: srcNode/msgId - the (source, sequence number) pair to remember.
-// Out: none. Writes into the ring-buffer dedup cache, evicting the oldest entry.
-void MeshLayer::_markSeen(char srcNode, uint8_t msgId) {
+// In: msgType/srcNode/msgId - the (type, source, sequence number) triple to
+//     remember. Out: none. Writes into the ring-buffer dedup cache, evicting
+//     the oldest entry.
+void MeshLayer::_markSeen(uint8_t msgType, char srcNode, uint8_t msgId) {
     _seenCache[_seenCacheIndex].used    = true;
+    _seenCache[_seenCacheIndex].msgType = msgType;
     _seenCache[_seenCacheIndex].srcNode = srcNode;
     _seenCache[_seenCacheIndex].msgId   = msgId;
     _seenCacheIndex = (_seenCacheIndex + 1) % MESH_SEEN_CACHE_SIZE;
@@ -378,30 +408,63 @@ void MeshLayer::_updateDirectory(char nodeId, const String& nickname) {
 }
 
 // In: none. Out: none.
-// Removes directory entries (other than our own) not heard from within
-// MESH_DIRECTORY_MAX_AGE_MS, firing the directory callback for each removal.
+// Removes directory entries (other than our own) that have missed two
+// consecutive heartbeats (MESH_NODE_TIMEOUT_MS), firing the directory
+// callback for each removal and purging any routing table entries that led
+// to or through the now-dead node.
 void MeshLayer::_expireDirectory() {
     unsigned long now = millis();
     for (int i = 0; i < MESH_DIRECTORY_SIZE; i++) {
         if (_directory[i].used && _directory[i].nodeId != _nodeId &&
-            now - _directory[i].lastSeen > MESH_DIRECTORY_MAX_AGE_MS) {
-            Serial.printf("[Mesh] Directory - node %c -> %s (stale)\n",
-                          _directory[i].nodeId, _directory[i].nickname);
+            now - _directory[i].lastSeen > MESH_NODE_TIMEOUT_MS) {
+            char deadNode = _directory[i].nodeId;
+            Serial.printf("[Mesh] Directory - node %c -> %s (heartbeat timeout)\n",
+                          deadNode, _directory[i].nickname);
             _directory[i].used = false;
             if (_directoryCallback) _directoryCallback();
+            _purgeRoutesForNode(deadNode);
+        }
+    }
+}
+
+// In: deadNode - node id that just missed two consecutive heartbeats and was
+//     evicted from the directory. Out: none.
+// Drops any routing table entry that leads TO deadNode, and any entry that
+// goes THROUGH deadNode as its next hop — a route depending on a next hop
+// that no longer exists is worse than useless, it's actively misleading.
+// Fires the route callback (removed=true) for each entry dropped so UI/BLE
+// listeners stay in sync; a fresh route can always be relearned later from
+// traffic/beacons if the node comes back.
+void MeshLayer::_purgeRoutesForNode(char deadNode) {
+    for (int i = 0; i < MESH_ROUTE_TABLE_SIZE; i++) {
+        if (_routes[i].used && (_routes[i].destNode == deadNode || _routes[i].nextHop == deadNode)) {
+            char destNode = _routes[i].destNode;
+            Serial.printf("[Mesh] Route - dest %c (via dead node %c)\n", destNode, deadNode);
+            _routes[i].used = false;
+            if (_routeCallback) _routeCallback(destNode, 0, 0, true);
         }
     }
 }
 
 // In: destNode - node the route leads to; viaNextHop - neighbor to reach it
 //     through; cost - hop count for this candidate route.
-// Out: none. Ignores routes to ourselves/broadcast. Updates the existing
-// entry for destNode if the new info is cheaper, refreshes the same next
-// hop, or the old entry is stale; otherwise inserts a new entry (evicting
-// the oldest if the table is full). Fires the route callback only when the
-// next hop or cost actually changes value (or the entry is new) — a plain
-// timestamp refresh of an unchanged route does not fire it, so UI/BLE
-// listeners aren't spammed on every packet from an already-known neighbor.
+// Out: none. Ignores routes to ourselves/broadcast. For an existing entry:
+// a sighting via the SAME next hop always refreshes it immediately (that's
+// just confirming the active path is still alive), and replacing an already
+// STALE entry also happens immediately (there's no working path to protect).
+// But a cheaper route via a DIFFERENT next hop is staged as a candidate and
+// only actually committed once it's been independently observed
+// MESH_ROUTE_CONFIRM_COUNT times — a single marginal/one-off reception (e.g.
+// an occasional direct link that isn't really reliable) must not be able to
+// instantly "shortcut" a route away from an already-working multi-hop path;
+// a genuinely reliable alternative will keep showing up and get promoted
+// within the next beacon cycle or two, a fluke won't repeat and never will.
+// Inserts a new entry outright if destNode isn't known yet (evicting the
+// oldest if the table is full) — no corroboration needed when there's no
+// existing route to protect. Fires the route callback only when the
+// committed next hop or cost actually changes (or the entry is new) — a
+// plain timestamp refresh, or a candidate that hasn't been promoted yet,
+// does not fire it, so UI/BLE listeners aren't spammed.
 void MeshLayer::_learnRoute(char destNode, char viaNextHop, uint8_t cost) {
     if (destNode == _nodeId || destNode == NODE_BROADCAST) return;
 
@@ -409,16 +472,47 @@ void MeshLayer::_learnRoute(char destNode, char viaNextHop, uint8_t cost) {
 
     for (int i = 0; i < MESH_ROUTE_TABLE_SIZE; i++) {
         if (_routes[i].used && _routes[i].destNode == destNode) {
-            bool sameNextHop  = _routes[i].nextHop == viaNextHop;
-            bool better       = cost < _routes[i].cost;
-            bool stale        = (now - _routes[i].lastUpdated) > MESH_ROUTE_MAX_AGE_MS;
-            bool valueChanged = (_routes[i].nextHop != viaNextHop) || (_routes[i].cost != cost);
-            if (sameNextHop || better || stale) {
-                _routes[i].nextHop     = viaNextHop;
-                _routes[i].cost        = cost;
-                _routes[i].lastUpdated = now;
+            bool sameNextHop = _routes[i].nextHop == viaNextHop;
+            bool stale       = (now - _routes[i].lastUpdated) > MESH_ROUTE_MAX_AGE_MS;
+
+            if (sameNextHop) {
+                bool valueChanged = _routes[i].cost != cost;
+                _routes[i].cost          = cost;
+                _routes[i].lastUpdated   = now;
+                _routes[i].candidateSeen = 0; // active path just reconfirmed itself; drop any pending candidate
                 if (valueChanged && _routeCallback) _routeCallback(destNode, viaNextHop, cost, false);
+                return;
             }
+
+            if (stale) {
+                _routes[i].nextHop       = viaNextHop;
+                _routes[i].cost          = cost;
+                _routes[i].lastUpdated   = now;
+                _routes[i].candidateSeen = 0;
+                if (_routeCallback) _routeCallback(destNode, viaNextHop, cost, false);
+                return;
+            }
+
+            if (cost < _routes[i].cost) {
+                if (_routes[i].candidateNextHop == viaNextHop) {
+                    _routes[i].candidateSeen++;
+                } else {
+                    _routes[i].candidateNextHop = viaNextHop;
+                    _routes[i].candidateCost    = cost;
+                    _routes[i].candidateSeen    = 1;
+                }
+
+                if (_routes[i].candidateSeen >= MESH_ROUTE_CONFIRM_COUNT) {
+                    _routes[i].nextHop       = _routes[i].candidateNextHop;
+                    _routes[i].cost          = _routes[i].candidateCost;
+                    _routes[i].lastUpdated   = now;
+                    _routes[i].candidateSeen = 0;
+                    Serial.printf("[Mesh] Route ~ dest %c switching to %c (cost %u, confirmed)\n",
+                                  destNode, _routes[i].nextHop, _routes[i].cost);
+                    if (_routeCallback) _routeCallback(destNode, _routes[i].nextHop, _routes[i].cost, false);
+                }
+            }
+            // Otherwise (cost >= existing, different next hop, not stale): ignore — the active route is at least as good.
             return;
         }
     }
@@ -438,24 +532,29 @@ void MeshLayer::_learnRoute(char destNode, char viaNextHop, uint8_t cost) {
         }
     }
 
-    _routes[slot].used        = true;
-    _routes[slot].destNode    = destNode;
-    _routes[slot].nextHop     = viaNextHop;
-    _routes[slot].cost        = cost;
-    _routes[slot].lastUpdated = now;
+    _routes[slot].used            = true;
+    _routes[slot].destNode        = destNode;
+    _routes[slot].nextHop         = viaNextHop;
+    _routes[slot].cost            = cost;
+    _routes[slot].lastUpdated     = now;
+    _routes[slot].candidateNextHop = 0;
+    _routes[slot].candidateCost    = 0;
+    _routes[slot].candidateSeen    = 0;
 
     Serial.printf("[Mesh] Route + dest %c via %c (cost %u)\n", destNode, viaNextHop, cost);
     if (_routeCallback) _routeCallback(destNode, viaNextHop, cost, false);
 }
 
 // In: destNode - node to find a route to.
-// Out: outNextHop set to the known next hop on success; returns true if a
-//      route exists, false if destNode isn't in the table (caller should
-//      fall back to NODE_BROADCAST/flood).
-bool MeshLayer::_lookupRoute(char destNode, char& outNextHop) const {
+// Out: outNextHop set to the known next hop on success; outCost (if
+//      non-null) set to the route's hop count; returns true if a route
+//      exists, false if destNode isn't in the table (caller should fall back
+//      to NODE_BROADCAST/flood).
+bool MeshLayer::_lookupRoute(char destNode, char& outNextHop, uint8_t* outCost) const {
     for (int i = 0; i < MESH_ROUTE_TABLE_SIZE; i++) {
         if (_routes[i].used && _routes[i].destNode == destNode) {
             outNextHop = _routes[i].nextHop;
+            if (outCost) *outCost = _routes[i].cost;
             return true;
         }
     }
@@ -477,10 +576,12 @@ void MeshLayer::_expireRoutes() {
     }
 }
 
-// In: destNode - node the chat was sent to; msgId - its sequence number.
-// Out: none. Records an in-flight send awaiting an ACK, evicting the oldest
-// pending entry if the table is full.
-void MeshLayer::_addPendingAck(char destNode, uint8_t msgId) {
+// In: destNode - node the chat was sent to; msgId - its sequence number;
+//     message - the chat text (kept so a retry can rebuild an identical
+//     packet); retryIntervalMs - resend cadence for this message (hop count
+//     scaled). Out: none. Records an in-flight send awaiting an ACK,
+//     evicting the oldest pending entry if the table is full.
+void MeshLayer::_addPendingAck(char destNode, uint8_t msgId, const String& message, unsigned long retryIntervalMs) {
     int slot = -1;
     for (int i = 0; i < MESH_PENDING_ACK_SIZE; i++) {
         if (!_pendingAcks[i].used) { slot = i; break; }
@@ -497,38 +598,94 @@ void MeshLayer::_addPendingAck(char destNode, uint8_t msgId) {
         }
     }
 
-    _pendingAcks[slot].used     = true;
-    _pendingAcks[slot].destNode = destNode;
-    _pendingAcks[slot].msgId    = msgId;
-    _pendingAcks[slot].sentAt   = millis();
+    unsigned long now = millis();
+    _pendingAcks[slot].used            = true;
+    _pendingAcks[slot].destNode        = destNode;
+    _pendingAcks[slot].msgId           = msgId;
+    _pendingAcks[slot].sentAt          = now;
+    _pendingAcks[slot].lastSentAt      = now;
+    _pendingAcks[slot].retryIntervalMs = retryIntervalMs;
+    _pendingAcks[slot].retryCount      = 0;
+    _pendingAcks[slot].message         = message;
 }
 
 // In: destNode - node that sent the ACK; msgId - the original msgId it acks.
 // Out: none. Clears the matching pending entry and fires the delivery
-// callback with MESH_DELIVERY_ACKED if found; no-op otherwise.
+// callback with MESH_DELIVERY_ACKED and the round-trip time (millis() minus
+// the recorded send timestamp, via unsigned subtraction so it stays correct
+// even if millis() has wrapped around since the message was sent); no-op if
+// no matching entry is found.
 void MeshLayer::_resolvePendingAck(char destNode, uint8_t msgId) {
     for (int i = 0; i < MESH_PENDING_ACK_SIZE; i++) {
         if (_pendingAcks[i].used && _pendingAcks[i].destNode == destNode && _pendingAcks[i].msgId == msgId) {
+            unsigned long elapsedMs = (unsigned long)(millis() - _pendingAcks[i].sentAt);
             _pendingAcks[i].used = false;
-            if (_deliveryCallback) _deliveryCallback(destNode, msgId, MESH_DELIVERY_ACKED);
+            if (_deliveryCallback) _deliveryCallback(destNode, msgId, MESH_DELIVERY_ACKED, elapsedMs);
             return;
         }
     }
 }
 
 // In: none. Out: none.
-// Sweeps pending acks older than MESH_ACK_TIMEOUT_MS, clearing them and
-// firing the delivery callback with MESH_DELIVERY_FAILED for each.
-void MeshLayer::_expirePendingAcks() {
+// Called every update(). For each in-flight send: if the absolute
+// MESH_ACK_TIMEOUT_MS ceiling has elapsed since the original send, fail it
+// regardless of retry state (a backstop against a badly-wrong hop-count
+// assumption). Otherwise, once its retry interval has elapsed with no ack:
+// retransmit (up to MESH_MAX_RETRIES times) and reset the interval, or — if
+// retries are already exhausted — fail it. Failing fires the delivery
+// callback with MESH_DELIVERY_FAILED and elapsedMs=0 (a timeout/give-up has
+// no real round-trip time to report).
+void MeshLayer::_servicePendingAcks() {
     unsigned long now = millis();
     for (int i = 0; i < MESH_PENDING_ACK_SIZE; i++) {
-        if (_pendingAcks[i].used && now - _pendingAcks[i].sentAt > MESH_ACK_TIMEOUT_MS) {
-            char    destNode = _pendingAcks[i].destNode;
-            uint8_t msgId    = _pendingAcks[i].msgId;
+        if (!_pendingAcks[i].used) continue;
+
+        char    destNode = _pendingAcks[i].destNode;
+        uint8_t msgId    = _pendingAcks[i].msgId;
+
+        if (now - _pendingAcks[i].sentAt > MESH_ACK_TIMEOUT_MS) {
             _pendingAcks[i].used = false;
-            if (_deliveryCallback) _deliveryCallback(destNode, msgId, MESH_DELIVERY_FAILED);
+            if (_deliveryCallback) _deliveryCallback(destNode, msgId, MESH_DELIVERY_FAILED, 0);
+            continue;
         }
+
+        if (now - _pendingAcks[i].lastSentAt < _pendingAcks[i].retryIntervalMs) {
+            continue; // still within this attempt's window
+        }
+
+        if (_pendingAcks[i].retryCount >= MESH_MAX_RETRIES) {
+            Serial.printf("[Mesh] Msg %u to %c: giving up after %u retries\n",
+                          msgId, destNode, (unsigned)_pendingAcks[i].retryCount);
+            _pendingAcks[i].used = false;
+            if (_deliveryCallback) _deliveryCallback(destNode, msgId, MESH_DELIVERY_FAILED, 0);
+            continue;
+        }
+
+        _pendingAcks[i].retryCount++;
+        _pendingAcks[i].lastSentAt = now;
+        Serial.printf("[Mesh] Msg %u to %c: retry %u/%u\n",
+                      msgId, destNode, (unsigned)_pendingAcks[i].retryCount, (unsigned)MESH_MAX_RETRIES);
+        _retransmitChat(_pendingAcks[i]);
     }
+}
+
+// In: pending - the in-flight send to retransmit (destNode/msgId/message
+//     already recorded). Out: none.
+// Rebuilds and resends an identical MSG_CHAT packet — same msgId, so the
+// destination's dedup cache recognizes and drops the extra copy if the
+// original already arrived, rather than re-delivering it — using a
+// freshly-looked-up next hop in case routing has improved, or the original
+// next hop went stale/was evicted, since this message was first sent.
+void MeshLayer::_retransmitChat(const PendingAck& pending) {
+    char chosenNextHop = NODE_BROADCAST;
+    _lookupRoute(pending.destNode, chosenNextHop);
+
+    uint8_t packet[MESH_HEADER_LEN + MESH_MAX_PAYLOAD];
+    size_t  packetLen = 0;
+    _buildPacket(packet, packetLen, MSG_CHAT, _nodeId, pending.destNode, chosenNextHop,
+                 pending.msgId, MESH_DEFAULT_TTL, pending.message);
+
+    loraSendRaw(packet, packetLen);
 }
 
 // In: toNode - node to send the ACK to (the original chat's sender);
@@ -547,7 +704,7 @@ void MeshLayer::_sendAck(char toNode, uint8_t ackedMsgId) {
     _buildPacket(packet, packetLen, MSG_ACK, _nodeId, toNode, chosenNextHop, msgId, MESH_DEFAULT_TTL,
                  payload, 1);
 
-    _markSeen(_nodeId, msgId);
+    _markSeen(MSG_ACK, _nodeId, msgId);
     loraSendRaw(packet, packetLen);
 }
 
@@ -564,7 +721,7 @@ void MeshLayer::_broadcastPresence() {
     _buildPacket(packet, packetLen, MSG_PRESENCE, _nodeId, NODE_BROADCAST, NODE_BROADCAST, msgId,
                  MESH_DEFAULT_TTL, _localNickname);
 
-    _markSeen(_nodeId, msgId);
+    _markSeen(MSG_PRESENCE, _nodeId, msgId);
     loraSendRaw(packet, packetLen);
 }
 

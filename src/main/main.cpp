@@ -10,7 +10,7 @@
 // Node ID is derived from the BLE device name suffix, e.g. "LastLink-A" -> 'A'.
 // To stand up another node, just change DEVICE_NAME below (or move it to
 // config.h if you want it per-build via build_flags).
-#define DEVICE_NAME "LastLink-B"
+#define DEVICE_NAME "LastLink-C"
 
 // In: deviceName - the BLE advertised name (e.g. "LastLink-A"). Out: the
 //     single-character node id parsed after the last '-', or the name's
@@ -199,11 +199,14 @@ void onMeshChatReceived(const String& senderNickname, char srcNode, const String
 }
 
 // In: destNode - node the original chat was sent to; msgId - its sequence
-//     number; status - MESH_DELIVERY_ACKED or MESH_DELIVERY_FAILED. Out: none.
+//     number; status - MESH_DELIVERY_ACKED or MESH_DELIVERY_FAILED;
+//     elapsedMs - round-trip time in ms, meaningful only when status is
+//     MESH_DELIVERY_ACKED (always 0 for a timeout). Out: none.
 // Logs the outcome, pushes a structured "[ACK]" line (tagged with msgId so
 // the phone can match it to the specific message it sent) over BLE, and — if
-// this is the most recently sent message — fires the OLED delivery-status event.
-void onMeshDeliveryStatus(char destNode, uint8_t msgId, MeshDeliveryStatus status) {
+// this is the most recently sent message — fires the OLED delivery-status
+// event, passing the round-trip time along for display.
+void onMeshDeliveryStatus(char destNode, uint8_t msgId, MeshDeliveryStatus status, unsigned long elapsedMs) {
     bool delivered = (status == MESH_DELIVERY_ACKED);
     String statusStr = delivered ? "delivered" : "failed";
     Serial.printf("[Mesh] Msg %u to %c: %s\n", msgId, destNode, statusStr.c_str());
@@ -214,7 +217,7 @@ void onMeshDeliveryStatus(char destNode, uint8_t msgId, MeshDeliveryStatus statu
 
     if (g_lastSentPending && destNode == g_lastSentDest && msgId == g_lastSentMsgId) {
         g_lastSentPending = false;
-        Ui.notifyAckReceived(destNode, delivered);
+        Ui.notifyAckReceived(destNode, delivered, elapsedMs);
     }
 }
 
