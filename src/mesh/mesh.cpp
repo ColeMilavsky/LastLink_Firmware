@@ -654,8 +654,7 @@ void MeshLayer::_servicePendingAcks() {
         }
 
         if (_pendingAcks[i].retryCount >= MESH_MAX_RETRIES) {
-            Serial.printf("[Mesh] Msg %u to %c: giving up after %u retries\n",
-                          msgId, destNode, (unsigned)_pendingAcks[i].retryCount);
+            Serial.printf("[Mesh] Msg %u to %c: giving up after %u retries\n", msgId, destNode, (unsigned)_pendingAcks[i].retryCount);
             _pendingAcks[i].used = false;
             if (_deliveryCallback) _deliveryCallback(destNode, msgId, MESH_DELIVERY_FAILED, 0);
             continue;
@@ -663,8 +662,7 @@ void MeshLayer::_servicePendingAcks() {
 
         _pendingAcks[i].retryCount++;
         _pendingAcks[i].lastSentAt = now;
-        Serial.printf("[Mesh] Msg %u to %c: retry %u/%u\n",
-                      msgId, destNode, (unsigned)_pendingAcks[i].retryCount, (unsigned)MESH_MAX_RETRIES);
+        Serial.printf("[Mesh] Msg %u to %c: retry %u/%u\n", msgId, destNode, (unsigned)_pendingAcks[i].retryCount, (unsigned)MESH_MAX_RETRIES);
         _retransmitChat(_pendingAcks[i]);
     }
 }
@@ -718,8 +716,7 @@ void MeshLayer::_broadcastPresence() {
     size_t  packetLen = 0;
     uint8_t msgId = _nextMsgId++;
 
-    _buildPacket(packet, packetLen, MSG_PRESENCE, _nodeId, NODE_BROADCAST, NODE_BROADCAST, msgId,
-                 MESH_DEFAULT_TTL, _localNickname);
+    _buildPacket(packet, packetLen, MSG_PRESENCE, _nodeId, NODE_BROADCAST, NODE_BROADCAST, msgId, MESH_DEFAULT_TTL, _localNickname);
 
     _markSeen(MSG_PRESENCE, _nodeId, msgId);
     loraSendRaw(packet, packetLen);

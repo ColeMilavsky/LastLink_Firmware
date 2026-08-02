@@ -10,7 +10,7 @@
 // Node ID is derived from the BLE device name suffix, e.g. "LastLink-A" -> 'A'.
 // To stand up another node, just change DEVICE_NAME below (or move it to
 // config.h if you want it per-build via build_flags).
-#define DEVICE_NAME "LastLink-C"
+#define DEVICE_NAME "LastLink-A"
 
 // In: deviceName - the BLE advertised name (e.g. "LastLink-A"). Out: the
 //     single-character node id parsed after the last '-', or the name's

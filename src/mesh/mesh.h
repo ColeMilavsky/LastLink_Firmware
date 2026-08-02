@@ -48,14 +48,14 @@
 #define MESH_HEADER_LEN      7
 #define MESH_DEFAULT_TTL     6        // max hops before a packet is dropped
 #define MESH_SEEN_CACHE_SIZE 32       // recently seen (srcNode,msgId) pairs
-#define MESH_PRESENCE_INTERVAL_MS 30000UL
+#define MESH_PRESENCE_INTERVAL_MS 5000UL
 // A node is considered dead after missing two consecutive heartbeats
 // (~60s at the current interval), plus a small grace margin so ordinary
 // scheduling/relay jitter doesn't evict a node that's only barely late.
 #define MESH_NODE_TIMEOUT_MS (2 * MESH_PRESENCE_INTERVAL_MS + 5000UL)
 #define MESH_DIRECTORY_SIZE  16
 #define MESH_ROUTE_TABLE_SIZE 16
-#define MESH_ROUTE_MAX_AGE_MS 120000UL     // route considered stale/replaceable
+#define MESH_ROUTE_MAX_AGE_MS 20000UL     // route considered stale/replaceable
 // A cheaper alternate next hop must be independently observed this many
 // times before an active (non-stale) route actually switches to it — a
 // single marginal/one-off reception (e.g. an occasional direct link that
@@ -65,12 +65,12 @@
 // a route that's currently active via a different next hop.
 #define MESH_ROUTE_CONFIRM_COUNT 2
 #define MESH_PENDING_ACK_SIZE 8
-#define MESH_ACK_TIMEOUT_MS   15000UL      // absolute ceiling on an in-flight send, regardless of retry math
+#define MESH_ACK_TIMEOUT_MS   30000UL      // absolute ceiling on an in-flight send, regardless of retry math
 // Resend cadence scales with hop count: hopCount * this. When no route is
 // known yet at send time, hop count defaults to MESH_DEFAULT_TTL (worst
 // case) rather than assuming a fast direct link — see sendChat().
-#define MESH_RETRY_INTERVAL_PER_HOP_MS 500UL
-#define MESH_MAX_RETRIES 10                 // total attempts = 1 original send + this many retries
+#define MESH_RETRY_INTERVAL_PER_HOP_MS 1000UL
+#define MESH_MAX_RETRIES 15                 // total attempts = 1 original send + this many retries
 
 enum MeshMsgType : uint8_t {
     MSG_CHAT     = 0x01,
