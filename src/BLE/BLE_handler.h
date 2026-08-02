@@ -11,19 +11,21 @@ public:
 
     void begin(const String& deviceName);
     void onMessage(BleLineCallback callback);
-    void onConnectionChange(BleConnectionCallback callback);  // NEW
+    void onConnectionChange(BleConnectionCallback callback);
     void send(const String& message);
-    void update();
+    void update();  // call every loop() — promotes a pending subscribe into the connected state
     bool isConnected() const { return _connected; }
 
     void _setConnected(bool connected);
     void _handleIncoming(const String& message);
+    void _onNotifyEnabled(); // called from the RX characteristic's CCCD write callback once the phone subscribes
 
 private:
     bool                   _connected;
-    String                 _deviceName;          // NEW — store our own name to report back
+    volatile bool          _pendingSubscribe;
+    String                 _deviceName;
     BleLineCallback        _messageCallback;
-    BleConnectionCallback  _connectionCallback;  // NEW
+    BleConnectionCallback  _connectionCallback;
 };
 
 extern BleHandler Ble;

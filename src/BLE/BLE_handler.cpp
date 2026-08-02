@@ -16,14 +16,11 @@ static BLECharacteristic* pTxCharacteristic = nullptr;
 static BLECharacteristic* pRxCharacteristic = nullptr;
 
 class LastLinkServerCallbacks : public BLEServerCallbacks {
-    // In: server - the BLE server that gained a connection. Out: none.
-    // Marks Ble as connected.
+    // Physical link only — not yet "connected" from the protocol's point of view until the phone subscribes.
     void onConnect(BLEServer* server) override {
-        Ble._setConnected(true);
-        Serial.println("[BLE] Phone connected");
+        Serial.println("[BLE] Phone link up, awaiting subscribe");
     }
 
-    // In: server - the BLE server that lost its connection. Out: none.
     // Marks Ble as disconnected and restarts advertising so another phone can connect.
     void onDisconnect(BLEServer* server) override {
         Ble._setConnected(false);
@@ -33,8 +30,7 @@ class LastLinkServerCallbacks : public BLEServerCallbacks {
 };
 
 class LastLinkTxCallbacks : public BLECharacteristicCallbacks {
-    // In: characteristic - the TX characteristic the phone just wrote to.
-    // Out: none. Forwards a non-empty written value into Ble's incoming-message path.
+    // Forwards a non-empty written value into Ble's incoming-message path.
     void onWrite(BLECharacteristic* characteristic) override {
         std::string value = characteristic->getValue();
         if (value.length() > 0) {
@@ -43,13 +39,21 @@ class LastLinkTxCallbacks : public BLECharacteristicCallbacks {
     }
 };
 
-// In: none. Out: none.
-// Constructs the handler in a disconnected state with no callbacks registered.
-BleHandler::BleHandler() : _connected(false), _messageCallback(nullptr), _connectionCallback(nullptr) {}
+class LastLinkRxCccdCallbacks : public BLEDescriptorCallbacks {
+    // Fires when the phone writes the RX characteristic's CCCD; enabling notifications here is the
+    // real "ready to receive" moment (the raw link-connect event fires well before this).
+    void onWrite(BLEDescriptor* descriptor) override {
+        uint8_t* value = descriptor->getValue();
+        if (descriptor->getLength() >= 1 && (value[0] & 0x01)) {
+            Ble._onNotifyEnabled();
+        }
+    }
+};
 
-// In: deviceName - the BLE advertised name (e.g. "LastLink-A"). Out: none.
-// Initializes the BLE stack, sets up the Nordic UART-style TX/RX
-// characteristics, and starts advertising under deviceName.
+// Constructs the handler in a disconnected state with no callbacks registered.
+BleHandler::BleHandler() : _connected(false), _pendingSubscribe(false), _messageCallback(nullptr), _connectionCallback(nullptr) {}
+
+// Initializes the BLE stack, sets up the Nordic UART-style TX/RX characteristics, and starts advertising.
 void BleHandler::begin(const String& deviceName) {
     _deviceName = deviceName;
 
@@ -80,7 +84,9 @@ void BleHandler::begin(const String& deviceName) {
         LASTLINK_RX_CHAR_UUID,
         BLECharacteristic::PROPERTY_NOTIFY
     );
-    pRxCharacteristic->addDescriptor(new BLE2902());
+    BLE2902* pRxCccd = new BLE2902();
+    pRxCccd->setCallbacks(new LastLinkRxCccdCallbacks());
+    pRxCharacteristic->addDescriptor(pRxCccd);
 
     pService->start();
 
@@ -105,43 +111,49 @@ void BleHandler::begin(const String& deviceName) {
     Serial.println("[BLE] Advertising as \"" + deviceName + "\"");
 }
 
-// In: callback - function to invoke when the phone writes a message. Out: none.
 void BleHandler::onMessage(BleLineCallback callback) {
     _messageCallback = callback;
 }
 
-// In: callback - function to invoke when the connection state changes. Out: none.
 void BleHandler::onConnectionChange(BleConnectionCallback callback) {
     _connectionCallback = callback;
 }
 
-// In: message - text to push to the connected phone. Out: none.
-// No-ops if no phone is connected; otherwise notifies via the RX characteristic.
+// No-ops if no phone is subscribed; otherwise notifies via the RX characteristic.
 void BleHandler::send(const String& message) {
     if (!_connected || pRxCharacteristic == nullptr) return;
     pRxCharacteristic->setValue(message.c_str());
     pRxCharacteristic->notify();
 }
 
-// In: none. Out: none. Reserved for future use (nothing to poll today).
+// Promotes a pending subscribe (flagged by the CCCD write callback) into the connected state.
+// Done here rather than directly in that callback so the resulting full BLE sync runs on the main
+// loop task, strictly before this tick's Mesh.update() — never racing a concurrent table mutation.
 void BleHandler::update() {
-    // Reserved for future use
+    if (_pendingSubscribe) {
+        _pendingSubscribe = false;
+        _setConnected(true);
+    }
 }
 
-// In: connected - the new connection state. Out: none.
 // Updates internal state and notifies the registered connection callback, if any.
 void BleHandler::_setConnected(bool connected) {
     _connected = connected;
+    if (!connected) _pendingSubscribe = false;
     if (_connectionCallback) {
         _connectionCallback(connected, _deviceName);
     }
 }
 
-// In: message - raw text written by the phone. Out: none.
-// Logs it and forwards it to the registered message callback, if any.
+// Logs and forwards a message written by the phone to the registered message callback, if any.
 void BleHandler::_handleIncoming(const String& message) {
     Serial.println("[BLE] RX from phone: " + message);
     if (_messageCallback) {
         _messageCallback(message);
     }
+}
+
+// Called from the RX characteristic's CCCD write callback once the phone enables notifications.
+void BleHandler::_onNotifyEnabled() {
+    _pendingSubscribe = true;
 }

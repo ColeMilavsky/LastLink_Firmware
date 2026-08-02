@@ -2,44 +2,41 @@
 
 // ─── Mesh Layer ────────────────────────────────────────────────────────────
 //
-// Flood-routing mesh over LoRa, with next-hop route learning layered on top.
-// Each node has a single-character Node ID (derived from its BLE device
-// name, e.g. "LastLink-A" -> 'A').
+// Flood-routing mesh over LoRa with next-hop route learning layered on top.
+// Each node has a single-character Node ID (derived from its BLE device name).
 //
 // A phone connects to exactly one node over BLE and registers a nickname.
-// Each node periodically broadcasts a presence beacon (nodeId, nickname) so
-// every node in range builds up a directory mapping nickname -> nodeId.
-// When a phone wants to message another phone by nickname, the local node
-// looks up the nickname's owning nodeId and addresses the packet to it.
+// Nodes broadcast presence beacons so every node builds a nickname -> nodeId
+// directory; sending to a nickname resolves it to a nodeId and addresses the
+// packet there.
 //
-// Routing strategy: every received packet (chat, presence, or ack) carries
-// a prevHop field identifying whoever just (re)transmitted it, which lets
-// any node passively learn "prevHop is a direct neighbor of mine" and "the
-// original srcNode is reachable via prevHop, at this hop cost" — no separate
-// discovery protocol needed, routes are learned from traffic already
-// flowing. A nextHop field lets a sender (or relaying node) address a
-// packet at a specific elected neighbor: only that neighbor re-relays it,
-// everyone else just overhears it for route learning and drops it. When no
-// route is known yet, nextHop is NODE_BROADCAST and every node in range
-// relays (the original flood behavior) — this is the fallback path.
+// Routes are learned passively: every packet carries a prevHop (whoever just
+// relayed it), so any node overhearing it learns "prevHop is a neighbor" and
+// "srcNode is reachable via prevHop". A nextHop field elects one relayer per
+// packet; NODE_BROADCAST means no route is known yet and everyone floods.
+//
+// MSG_ROUTE_ADV packets add path-vector info (BGP AS-PATH style) on top of
+// that, so nodes eventually learn full hop chains, not just next-hop+cost.
+// Never relayed — each node periodically re-advertises its own known routes
+// to its direct neighbors, and multi-hop knowledge propagates by each hop
+// folding what it hears into its own table and re-advertising that. Loop
+// prevention: reject any advertised path that already contains our own id.
 //
 // Packet layout (binary, sent as the LoRa payload):
-//   [0]     msgType   - MSG_CHAT, MSG_PRESENCE, or MSG_ACK
+//   [0]     msgType   - MSG_CHAT, MSG_PRESENCE, MSG_ACK, or MSG_ROUTE_ADV
 //   [1]     srcNode   - originating node id (ASCII char)
 //   [2]     dstNode   - final destination node id (ASCII char), or NODE_BROADCAST
-//   [3]     prevHop   - node id that just (re)transmitted this frame; rewritten
-//                       to the relaying node's own id on every hop
-//   [4]     nextHop   - node id elected to relay this next, or NODE_BROADCAST
-//                       to mean "no route known, everyone should flood-relay"
+//   [3]     prevHop   - node id that just (re)transmitted this frame
+//   [4]     nextHop   - elected relayer, or NODE_BROADCAST to mean "flood"
 //   [5]     msgId     - per-source sequence number, used for dedup
 //   [6]     ttl       - hop budget, decremented on every relay, dropped at 0
-//   [7..]   payload   - chat text, "nickname" for presence beacons, or a
-//                       single byte (the acked msgId) for MSG_ACK
+//   [7..]   payload   - chat text, nickname (presence), acked msgId (ack), or
+//                       for MSG_ROUTE_ADV: [entryCount, then per entry:
+//                       destNode, pathLen, path[pathLen]] (path excludes the
+//                       advertiser, which is already srcNode in the header)
 //
-// Hop cost is derived, not transmitted: a packet arriving with ttl consumed
-// (MESH_DEFAULT_TTL - ttl) hops has traveled that many relays already, so
-// cost-to-srcNode = (MESH_DEFAULT_TTL - ttl) + 1 from the receiver's point
-// of view. This keeps the header at 7 bytes instead of 8.
+// Hop cost is derived, not transmitted: cost-to-srcNode = (MESH_DEFAULT_TTL -
+// ttl) + 1 from the receiver's point of view. Keeps the header at 7 bytes.
 
 #include <Arduino.h>
 
@@ -49,33 +46,25 @@
 #define MESH_DEFAULT_TTL     6        // max hops before a packet is dropped
 #define MESH_SEEN_CACHE_SIZE 32       // recently seen (srcNode,msgId) pairs
 #define MESH_PRESENCE_INTERVAL_MS 5000UL
-// A node is considered dead after missing two consecutive heartbeats
-// (~60s at the current interval), plus a small grace margin so ordinary
-// scheduling/relay jitter doesn't evict a node that's only barely late.
-#define MESH_NODE_TIMEOUT_MS (2 * MESH_PRESENCE_INTERVAL_MS + 5000UL)
+#define MESH_NODE_TIMEOUT_MS (2 * MESH_PRESENCE_INTERVAL_MS + 5000UL) // ~2 missed beacons + grace margin
 #define MESH_DIRECTORY_SIZE  16
 #define MESH_ROUTE_TABLE_SIZE 16
 #define MESH_ROUTE_MAX_AGE_MS 20000UL     // route considered stale/replaceable
-// A cheaper alternate next hop must be independently observed this many
-// times before an active (non-stale) route actually switches to it — a
-// single marginal/one-off reception (e.g. an occasional direct link that
-// isn't really reliable) shouldn't be enough to shortcut a route away from
-// an already-working multi-hop path. Does not apply to brand-new
-// destinations or to replacing an already-stale entry — only to displacing
-// a route that's currently active via a different next hop.
-#define MESH_ROUTE_CONFIRM_COUNT 2
+#define MESH_ROUTE_CONFIRM_COUNT 2        // times a cheaper next hop must be reseen before it displaces an active route
+#define MESH_ROUTE_MIN_PROMOTE_SNR 0.0f   // min link quality (dB) for a next hop to displace an active route
+#define MESH_LINK_QUALITY_EWMA_ALPHA 0.3f // weight of each new SNR sample in the rolling link-quality average
+#define MESH_LINK_QUALITY_FAIL_PENALTY_DB 10.0f // subtracted from a neighbor's link quality on a real delivery failure
 #define MESH_PENDING_ACK_SIZE 8
 #define MESH_ACK_TIMEOUT_MS   30000UL      // absolute ceiling on an in-flight send, regardless of retry math
-// Resend cadence scales with hop count: hopCount * this. When no route is
-// known yet at send time, hop count defaults to MESH_DEFAULT_TTL (worst
-// case) rather than assuming a fast direct link — see sendChat().
-#define MESH_RETRY_INTERVAL_PER_HOP_MS 1000UL
+#define MESH_RETRY_INTERVAL_PER_HOP_MS 1000UL // resend cadence = hopCount * this
 #define MESH_MAX_RETRIES 15                 // total attempts = 1 original send + this many retries
+#define MESH_ROUTE_ADV_INTERVAL_MS 10000UL  // how often a node broadcasts its known routes to neighbors
 
 enum MeshMsgType : uint8_t {
-    MSG_CHAT     = 0x01,
-    MSG_PRESENCE = 0x02,
-    MSG_ACK      = 0x03,
+    MSG_CHAT       = 0x01,
+    MSG_PRESENCE   = 0x02,
+    MSG_ACK        = 0x03,
+    MSG_ROUTE_ADV  = 0x04, // path-vector route advertisement; never relayed
 };
 
 // Result of attempting to deliver/route an incoming mesh packet.
@@ -86,6 +75,7 @@ enum MeshRxAction {
     MESH_RX_PRESENCE,     // presence beacon, directory updated, possibly relayed
     MESH_RX_EXPIRED,      // ttl hit 0, dropped
     MESH_RX_ACK,          // delivery acknowledgement received/relayed
+    MESH_RX_ROUTE_ADV,    // route advertisement received and processed (never relayed)
 };
 
 // Delivery status for a chat message this node sent, tracked via ACK.
@@ -110,76 +100,63 @@ struct RouteEntry {
     uint8_t  cost          = 0; // hop count to destNode
     unsigned long lastUpdated = 0;
 
-    // Staging area for a cheaper candidate next hop that hasn't yet been
-    // corroborated enough times to actually replace the active route — see
-    // MeshLayer::_learnRoute().
+    // Staged candidate next hop awaiting confirmation — see MeshLayer::_learnRoute().
     char    candidateNextHop = 0;
     uint8_t candidateCost    = 0;
     uint8_t candidateSeen    = 0;
+
+    // Rolling link-quality signal (EWMA of SNR in dB); only meaningful on a
+    // direct-neighbor entry (destNode == nextHop). hasQuality false until first sample.
+    float linkQuality = 0;
+    bool  hasQuality   = false;
+
+    // Full path to destNode, one char per hop, not including this node.
+    // pathLen==0 means only next-hop+cost are known (passive-learning fallback).
+    char    path[MESH_DEFAULT_TTL] = {0};
+    uint8_t pathLen = 0;
 };
 
-// One in-flight chat message awaiting (or having received) an ACK. Doubles
-// as the retry-tracking record: the same packet (same msgId, so the
-// destination's dedup cache recognizes redundant copies) is retransmitted
-// on an interval until acked, retries are exhausted, or the absolute
-// timeout ceiling is hit.
+// One in-flight chat message awaiting an ACK; also the retry-tracking record.
 struct PendingAck {
     bool          used            = false;
     char          destNode        = 0;
     uint8_t       msgId           = 0;
-    unsigned long sentAt          = 0; // original send time — for round-trip-time reporting and the absolute timeout ceiling
-    unsigned long lastSentAt      = 0; // time of the most recent (re)transmission — gates the next retry
-    unsigned long retryIntervalMs = 0; // resend cadence for this message, frozen at send time (hopCount * MESH_RETRY_INTERVAL_PER_HOP_MS)
-    uint8_t       retryCount      = 0; // retries sent so far (0 = only the original send)
-    String        message;            // original chat text, so a retry can rebuild an identical packet with a freshly-looked-up next hop
+    unsigned long sentAt          = 0; // original send time, for RTT + absolute timeout
+    unsigned long lastSentAt      = 0; // gates the next retry
+    unsigned long retryIntervalMs = 0; // resend cadence, frozen at send time
+    uint8_t       retryCount      = 0;
+    String        message;            // original text, so a retry can rebuild the packet
 };
 
 // Callback invoked when a chat packet addressed to this node arrives.
-// senderNickname may be empty if the sender's nickname isn't known yet.
 typedef void (*MeshChatCallback)(const String& senderNickname, char srcNode, const String& message);
 
-// Callback invoked whenever the directory changes (new node/nickname seen,
-// or an entry expires) — handy for UI updates.
-typedef void (*MeshDirectoryCallback)();
+// Callback invoked whenever the directory changes (new/changed nickname, or eviction).
+typedef void (*MeshDirectoryCallback)(char nodeId, const String& nickname, bool removed);
 
-// Callback invoked when a chat message this node sent is acked or times out.
-// elapsedMs is the round-trip time in milliseconds from send to ack — only
-// meaningful when status==MESH_DELIVERY_ACKED; it is always 0 for
-// MESH_DELIVERY_FAILED, since a timeout has no real round trip to report.
+// Callback invoked when a sent chat is acked or times out (elapsedMs is RTT, 0 if failed).
 typedef void (*MeshDeliveryCallback)(char destNode, uint8_t msgId, MeshDeliveryStatus status, unsigned long elapsedMs);
 
 // Callback invoked when the routing table gains/updates or loses an entry.
-// Fired only on substantive changes (new destination, changed next hop/cost,
-// or expiry) — not on every packet that merely refreshes a timestamp.
-// removed=true means destNode's entry was dropped (nextHop/cost are 0).
 typedef void (*MeshRouteCallback)(char destNode, char nextHop, uint8_t cost, bool removed);
 
 class MeshLayer {
 public:
     MeshLayer();
 
-    // nodeId: this node's single-char identity, derived from BLE name.
     void begin(char nodeId);
-    void update();   // call every loop() — handles presence beacon timing, expiry, ack timeouts
+    void update();   // call every loop() — handles beacon/route-adv timing, expiry, ack timeouts
 
     // Local phone registration (called from BLE handler when phone sets a nickname).
     void setLocalNickname(const String& nickname);
     String localNickname() const { return _localNickname; }
     char   nodeId() const { return _nodeId; }
 
-    // Send a chat message from the locally-connected phone to a nickname.
-    // Looks up nickname in the directory; if unknown, sends as broadcast so
-    // it still has a chance to be picked up (and the directory to catch up).
-    // Unicast sends (resolved nickname) are tracked for delivery ACK.
-    // outDestNode/outMsgId (if non-null) receive the resolved destination
-    // node and assigned sequence number, so a caller (e.g. main.cpp) can
-    // correlate a later delivery-status callback back to this specific send.
-    // Returns false only on a hard local failure (radio error).
+    // Sends a chat to a nickname (broadcasts if unresolved); tracks unicast sends for delivery ACK.
     bool sendChat(const String& destNickname, const String& message,
                   char* outDestNode = nullptr, uint8_t* outMsgId = nullptr);
 
-    // Called by lora.cpp when a raw packet is received off the radio.
-    // Returns the action taken so callers (main.cpp) can decide what to log/show.
+    // Called by lora.cpp on a raw radio reception; returns the action taken.
     MeshRxAction handleIncomingPacket(const uint8_t* data, size_t len, int rssi, float snr);
 
     void onChatReceived(MeshChatCallback callback);
@@ -188,18 +165,17 @@ public:
     void onRouteChanged(MeshRouteCallback callback);
 
     // Directory introspection (for UI / debugging).
-    // outAgeMs is how long ago (in ms) this node's last heartbeat was heard,
-    // for showing a "missed a beacon" indicator once it exceeds one interval.
     int  directoryCount() const;
     bool directoryEntryAt(int index, char& outNodeId, String& outNickname, unsigned long& outAgeMs) const;
     bool resolveNickname(const String& nickname, char& outNodeId) const;
 
     // Routing table introspection (for UI / debugging).
-    // outAgeMs is how long ago (in ms) the entry was last refreshed, for
-    // showing a fresh/stale indicator.
     int  routeCount() const;
     bool routeEntryAt(int index, char& outDest, char& outNextHop, uint8_t& outCost,
                        unsigned long& outAgeMs) const;
+
+    // Full known path to destNode, if established; empty if only next-hop+cost are known so far.
+    bool routePathFor(char destNode, String& outPath) const;
 
 private:
     char     _nodeId;
@@ -215,16 +191,13 @@ private:
     RouteEntry     _routes[MESH_ROUTE_TABLE_SIZE];
     PendingAck     _pendingAcks[MESH_PENDING_ACK_SIZE];
 
-    // Dedup cache of recently seen (msgType, srcNode, msgId) triples. msgType
-    // is part of the key so a chat and an ack (or any other type) from the
-    // same node reusing the same sequence number are never mistaken for each
-    // other — a node's _nextMsgId counter is shared across every packet type
-    // it sends, so the type alone can't be inferred from srcNode+msgId.
+    // Dedup cache of recently seen (msgType, srcNode, msgId) triples.
     struct SeenEntry { bool used = false; uint8_t msgType = 0; char srcNode = 0; uint8_t msgId = 0; };
     SeenEntry _seenCache[MESH_SEEN_CACHE_SIZE];
     uint8_t   _seenCacheIndex;
 
     unsigned long _lastPresenceBroadcast;
+    unsigned long _lastRouteAdvBroadcast;
 
     bool _wasRecentlySeen(uint8_t msgType, char srcNode, uint8_t msgId);
     void _markSeen(uint8_t msgType, char srcNode, uint8_t msgId);
@@ -232,40 +205,42 @@ private:
     void _updateDirectory(char nodeId, const String& nickname);
     void _expireDirectory();
 
-    // Drops any routing table entry that leads to or through a node that
-    // just timed out — called from _expireDirectory() on eviction.
+    // Drops any route leading to/through a node that just timed out, and re-advertises if anything was removed.
     void _purgeRoutesForNode(char deadNode);
 
-    // Learns routes from any received packet: prevHop as a direct 1-hop
-    // neighbor, and srcNode as reachable via prevHop at the derived cost.
-    void _learnRoute(char destNode, char viaNextHop, uint8_t cost);
-    // outCost (if non-null) receives the route's hop count — used by
-    // sendChat() to scale the retry interval to hop count.
+    // Learns/updates a route to destNode via viaNextHop; path/pathLen attach path-vector info when known.
+    void _learnRoute(char destNode, char viaNextHop, uint8_t cost,
+                      const char* path = nullptr, uint8_t pathLen = 0);
     bool _lookupRoute(char destNode, char& outNextHop, uint8_t* outCost = nullptr) const;
     void _expireRoutes();
+
+    // Broadcasts this node's current route advertisement (routes it has a full path for).
+    void _broadcastRouteAdvertisement();
+
+    // Parses a neighbor's route advertisement, applies the path-vector loop check, and feeds accepted routes to _learnRoute().
+    void _handleRouteAdvertisement(char advertiser, const uint8_t* payload, size_t payloadLen);
+
+    // Blends a fresh SNR reading into a direct neighbor's rolling link-quality EWMA.
+    void _updateNeighborQuality(char neighborId, float snr);
+    bool _neighborQuality(char neighborId, float& outSnr) const;
+
+    // A real delivery failure invalidates destNode's route and dings the next hop's link quality.
+    void _penalizeRouteFailure(char destNode);
 
     void _addPendingAck(char destNode, uint8_t msgId, const String& message, unsigned long retryIntervalMs);
     void _resolvePendingAck(char destNode, uint8_t msgId);
 
-    // Called every update(): retransmits any in-flight send whose retry
-    // interval has elapsed (up to MESH_MAX_RETRIES times), or fails it once
-    // retries are exhausted or the absolute MESH_ACK_TIMEOUT_MS ceiling hits.
+    // Retransmits or fails any in-flight send whose retry interval/timeout has elapsed.
     void _servicePendingAcks();
 
-    // Rebuilds and resends a pending send's packet — same msgId (so the
-    // destination's dedup cache recognizes and drops the extra copy if the
-    // original already arrived), fresh ttl, and a freshly-looked-up next hop
-    // in case routing has changed since the message was first sent.
+    // Rebuilds and resends a pending send's packet with a freshly-looked-up next hop.
     void _retransmitChat(const PendingAck& pending);
 
     void _sendAck(char toNode, uint8_t ackedMsgId);
 
     void _broadcastPresence();
 
-    // Relays a packet: decrements ttl, rewrites prevHop to us, and sets
-    // nextHop to our own route-table lookup for dstNode (or broadcast if we
-    // don't have one either). Sends unconditionally — caller has already
-    // decided this node should relay.
+    // Relays a packet: decrements ttl, rewrites prevHop, elects our own next hop.
     void _relayPacket(const uint8_t* data, size_t len, char dstNode);
 
     void _buildPacket(uint8_t* out, size_t& outLen, MeshMsgType type,

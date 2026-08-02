@@ -6,71 +6,196 @@
 #include "../ui/UI.h"
 #include "config.h"
 
-// ─── Node identity ─────────────────────────────────────────────────────────
 // Node ID is derived from the BLE device name suffix, e.g. "LastLink-A" -> 'A'.
-// To stand up another node, just change DEVICE_NAME below (or move it to
-// config.h if you want it per-build via build_flags).
 #define DEVICE_NAME "LastLink-A"
 
-// In: deviceName - the BLE advertised name (e.g. "LastLink-A"). Out: the
-//     single-character node id parsed after the last '-', or the name's
-//     last character if there's no dash.
+// Parses the single-char node id after the last '-' in deviceName (or its last char if no dash).
 static char deriveNodeId(const String& deviceName) {
     int dash = deviceName.lastIndexOf('-');
     if (dash >= 0 && dash + 1 < (int)deviceName.length()) {
         return deviceName.charAt(dash + 1);
     }
-    // Fallback: last character of the name, so this never silently breaks
-    // if someone names a device without a dash.
     return deviceName.length() > 0 ? deviceName.charAt(deviceName.length() - 1) : '?';
+}
+
+// Default boot nickname: the node id as a one-character string (e.g. 'A' -> "A").
+static String deriveDefaultNickname(char nodeId) {
+    return String(nodeId);
 }
 
 enum MsgSource { SRC_SERIAL, SRC_BLE };
 
-// Tracks the most recent unicast send so onMeshDeliveryStatus() can tell
-// whether an ack/timeout belongs to it (and is therefore worth a brief OLED
-// overlay) versus an older, already-superseded in-flight message.
+// Tracks the most recent unicast send so onMeshDeliveryStatus() knows whether an ack/timeout is for it.
 static char    g_lastSentDest    = 0;
 static uint8_t g_lastSentMsgId   = 0;
 static bool    g_lastSentPending = false;
 
-// In: none. Out: none.
-// Pushes a "[STATUS] node=<id> nick=<nickname>" line to the connected phone
-// so it always knows which node/nickname it's on. No-op if nothing's connected.
+// ─── BLE node-sync (combined directory + route view for the phone) ────────
+// Nodes marked dirty this tick get one coalesced [NODE+]/[NODE-] push via flushNodeSync().
+#define BLE_NODE_SYNC_SIZE 16
+struct PendingNodeSync { bool used = false; char nodeId = 0; };
+static PendingNodeSync g_pendingNodeSync[BLE_NODE_SYNC_SIZE];
+
+// Safe per-notify payload cap (well under a possibly-lower-than-247 negotiated MTU) and the largest
+// entry count either full-sync dump can produce, for sizing the chunk-boundary scratch array below.
+#define BLE_SYNC_CHUNK_MAX_LEN 150
+#define BLE_SYNC_MAX_ENTRIES ((MESH_DIRECTORY_SIZE > MESH_ROUTE_TABLE_SIZE) ? MESH_DIRECTORY_SIZE : MESH_ROUTE_TABLE_SIZE)
+
+// Sends entries[0..count) as one or more "tag[ i/N] e1,e2,..." notifications, split on entry
+// boundaries (never mid-entry) so a long dump can't get truncated at the BLE layer. The "i/N" suffix
+// is only added when more than one chunk is actually needed, so a small mesh keeps the plain
+// "tag e1,e2,..." format unchanged.
+static void sendEntriesChunked(const String& tag, String* entries, int count) {
+    if (!Ble.isConnected()) return;
+
+    int chunkStart[BLE_SYNC_MAX_ENTRIES + 1];
+    int chunkCount = 0;
+    int i = 0;
+    do {
+        chunkStart[chunkCount++] = i;
+        int len = 0;
+        while (i < count) {
+            int add = entries[i].length() + (len > 0 ? 1 : 0);
+            if (len > 0 && len + add > BLE_SYNC_CHUNK_MAX_LEN) break;
+            len += add;
+            i++;
+        }
+    } while (i < count);
+    chunkStart[chunkCount] = count;
+
+    for (int c = 0; c < chunkCount; c++) {
+        String msg = tag;
+        if (chunkCount > 1) msg += " " + String(c + 1) + "/" + String(chunkCount);
+        msg += " ";
+        for (int k = chunkStart[c]; k < chunkStart[c + 1]; k++) {
+            if (k > chunkStart[c]) msg += ",";
+            msg += entries[k];
+        }
+        Ble.send(msg);
+    }
+}
+
+// Marks nodeId dirty for the next flushNodeSync(); idempotent.
+static void markNodeDirty(char nodeId) {
+    for (int i = 0; i < BLE_NODE_SYNC_SIZE; i++) {
+        if (g_pendingNodeSync[i].used && g_pendingNodeSync[i].nodeId == nodeId) return;
+    }
+    for (int i = 0; i < BLE_NODE_SYNC_SIZE; i++) {
+        if (!g_pendingNodeSync[i].used) {
+            g_pendingNodeSync[i].used   = true;
+            g_pendingNodeSync[i].nodeId = nodeId;
+            return;
+        }
+    }
+}
+
+// Looks up nodeId's nickname (directory) and hop count (routing table); returns false if known in neither.
+static bool lookupNodeSyncInfo(char nodeId, String& outNickname, uint8_t& outHops, bool& outHopsKnown) {
+    bool foundNickname = false;
+    for (int i = 0; i < Mesh.directoryCount(); i++) {
+        char          dirNodeId;
+        String        dirNickname;
+        unsigned long ageMs;
+        if (Mesh.directoryEntryAt(i, dirNodeId, dirNickname, ageMs) && dirNodeId == nodeId) {
+            outNickname   = dirNickname;
+            foundNickname = true;
+            break;
+        }
+    }
+
+    outHopsKnown = (nodeId == Mesh.nodeId());
+    outHops      = 0;
+    if (!outHopsKnown) {
+        for (int i = 0; i < Mesh.routeCount(); i++) {
+            char          dest, nextHop;
+            uint8_t       cost;
+            unsigned long ageMs;
+            if (Mesh.routeEntryAt(i, dest, nextHop, cost, ageMs) && dest == nodeId) {
+                outHops      = cost;
+                outHopsKnown = true;
+                break;
+            }
+        }
+    }
+
+    return foundNickname || outHopsKnown;
+}
+
+// Sends "[NODE+]" or "[NODE-]" for nodeId's current combined state.
+static void pushNodeSync(char nodeId) {
+    if (!Ble.isConnected()) return;
+
+    String  nickname;
+    uint8_t hops;
+    bool    hopsKnown;
+    if (!lookupNodeSyncInfo(nodeId, nickname, hops, hopsKnown)) {
+        Ble.send("[NODE-] id=" + String(nodeId));
+        return;
+    }
+
+    Ble.send("[NODE+] id=" + String(nodeId) + " nick=" + nickname + " hops=" + (hopsKnown ? String(hops) : "?"));
+}
+
+// Pushes a sync line for every node marked dirty since the last flush, then clears the pending set.
+static void flushNodeSync() {
+    for (int i = 0; i < BLE_NODE_SYNC_SIZE; i++) {
+        if (g_pendingNodeSync[i].used) {
+            pushNodeSync(g_pendingNodeSync[i].nodeId);
+            g_pendingNodeSync[i].used = false;
+        }
+    }
+}
+
+// Pushes a full "[NODES] id:nick:hops,..." dump (chunked if long); used once on BLE connect.
+void pushFullNodeSync() {
+    if (!Ble.isConnected()) return;
+
+    String entries[BLE_SYNC_MAX_ENTRIES];
+    int    count = 0;
+    int    total = Mesh.directoryCount();
+    for (int i = 0; i < total && count < BLE_SYNC_MAX_ENTRIES; i++) {
+        char          nodeId;
+        String        dirNickname;
+        unsigned long ageMs;
+        if (!Mesh.directoryEntryAt(i, nodeId, dirNickname, ageMs)) continue;
+
+        String  nickname;
+        uint8_t hops;
+        bool    hopsKnown;
+        lookupNodeSyncInfo(nodeId, nickname, hops, hopsKnown); // always true here — nodeId came from the directory itself
+
+        entries[count++] = String(nodeId) + ":" + nickname + ":" + (hopsKnown ? String(hops) : "?");
+    }
+    sendEntriesChunked("[NODES]", entries, count);
+}
+
+// Pushes "[STATUS] node=<id> nick=<nickname>" to the connected phone.
 void pushMeshStatus() {
     if (!Ble.isConnected()) return;
     Ble.send("[STATUS] node=" + String(Mesh.nodeId()) + " nick=" + Mesh.localNickname());
 }
 
-// In: none. Out: none.
-// Pushes a full "[ROUTES] dest:nextHop:cost:ageSeconds,..." dump of the
-// current routing table to the connected phone. Used once on BLE connect so
-// the app starts with complete state; subsequent changes travel as smaller
-// [ROUTE+]/[ROUTE-] deltas from onMeshRouteChanged(). No-op if not connected.
+// Pushes a full "[ROUTES] dest:nextHop:cost:ageSeconds:path,..." dump (chunked if long); used once on BLE connect.
 void pushRouteDump() {
     if (!Ble.isConnected()) return;
 
-    String msg = "[ROUTES] ";
-    int count = Mesh.routeCount();
-    for (int i = 0; i < count; i++) {
+    String entries[BLE_SYNC_MAX_ENTRIES];
+    int    count = 0;
+    int    total = Mesh.routeCount();
+    for (int i = 0; i < total && count < BLE_SYNC_MAX_ENTRIES; i++) {
         char          dest, nextHop;
         uint8_t       cost;
         unsigned long ageMs;
         if (Mesh.routeEntryAt(i, dest, nextHop, cost, ageMs)) {
-            if (i > 0) msg += ",";
-            msg += String(dest) + ":" + String(nextHop) + ":" + String(cost) + ":" + String(ageMs / 1000);
+            String path;
+            Mesh.routePathFor(dest, path);
+            entries[count++] = String(dest) + ":" + String(nextHop) + ":" + String(cost) + ":" + String(ageMs / 1000) + ":" + path;
         }
     }
-    Ble.send(msg);
+    sendEntriesChunked("[ROUTES]", entries, count);
 }
 
-// ─── Outgoing chat (typed locally over Serial, or relayed from this node's
-//     own phone) — addressed to a nickname, or broadcast if none given ──────
-// In: destNickname - target nickname (empty = broadcast); message - text to
-//     send; source - where the send originated (Serial or BLE), used for logging/UI.
-// Out: none. Drives the OLED send animation, calls Mesh.sendChat(), logs/
-// displays success or failure, and for unicast sends, tracks the assigned
-// msgId and pushes "[SENT]" so the phone can correlate a later ack.
+// Sends a chat (typed over Serial, or from this node's own phone) to a nickname, or broadcasts if none given.
 void sendChat(const String& destNickname, const String& message, MsgSource source) {
     String tag = (source == SRC_BLE) ? "BLE" : "SERIAL";
     String label = destNickname.length() ? (tag + "->" + destNickname) : tag;
@@ -105,9 +230,7 @@ void sendChat(const String& destNickname, const String& message, MsgSource sourc
     }
 }
 
-// In: line - raw input, optionally in "@nickname message text" form.
-// Out: destNickname/message split from line; destNickname is left empty
-//      (meaning broadcast) if there's no leading '@'.
+// Splits "@nickname message text" into destNickname/message; destNickname empty means broadcast.
 static void parseAddressedMessage(const String& line, String& destNickname, String& message) {
     destNickname = "";
     message = line;
@@ -121,12 +244,8 @@ static void parseAddressedMessage(const String& line, String& destNickname, Stri
     }
 }
 
-// In: line - a complete line typed over Serial. Out: none.
-// Handles the local "/nick" convenience command, otherwise parses it as an
-// addressed or broadcast chat message and sends it.
+// Handles "/nick" over Serial, otherwise parses and sends the line as a chat.
 void onSerialMessage(const String& line) {
-    // Local debug convenience: typing "/nick Foo" on Serial sets this node's
-    // own phone-facing nickname too, same as the phone would over BLE.
     if (line.startsWith("/nick ")) {
         Mesh.setLocalNickname(line.substring(6));
         Ui.setIdentity(Mesh.nodeId(), Mesh.localNickname());
@@ -140,11 +259,8 @@ void onSerialMessage(const String& line) {
     sendChat(destNickname, message, SRC_SERIAL);
 }
 
-// In: message - raw text written by the connected phone. Out: none.
-// Handles the "/nick" registration command (acking over BLE), otherwise
-// parses it as an addressed or broadcast chat message and sends it.
+// Handles "/nick" from the phone (acked over BLE), otherwise parses and sends the message as a chat.
 void onBleMessage(const String& message) {
-    // Phone registers/changes its nickname with "/nick Foo".
     if (message.startsWith("/nick ")) {
         String nickname = message.substring(6);
         nickname.trim();
@@ -155,32 +271,24 @@ void onBleMessage(const String& message) {
         return;
     }
 
-    // Phone addresses a specific other phone with "@nickname message".
     String destNickname, chatMessage;
     parseAddressedMessage(message, destNickname, chatMessage);
     sendChat(destNickname, chatMessage, SRC_BLE);
 }
 
-// In: connected - new BLE connection state; deviceName - the connected
-//     device's name (unused when disconnected). Out: none.
-// Fires the connected/disconnected OLED event, and on a fresh connection
-// pushes the phone its initial state (node identity + full routing table)
-// since it starts with no prior knowledge.
+// Fires the OLED connect/disconnect event, and on connect pushes the phone its initial state.
 void onBleConnectionChange(bool connected, const String& deviceName) {
     if (connected) {
         Ui.notifyBleConnected(deviceName);
         pushMeshStatus();
         pushRouteDump();
+        pushFullNodeSync();
     } else {
         Ui.notifyBleDisconnected();
     }
 }
 
-// ─── Incoming chat from the mesh, addressed to us or broadcast ─────────────
-// In: senderNickname - sender's nickname if known (empty otherwise); srcNode
-//     - sender's node id; message - the chat text. Out: none.
-// Logs the message, fires the OLED "message received" event (sender +
-// content), and forwards it to the connected phone over BLE if one is present.
+// Logs and displays an incoming chat, and forwards it to the connected phone over BLE.
 void onMeshChatReceived(const String& senderNickname, char srcNode, const String& message) {
     String from = senderNickname.length() ? senderNickname : String(srcNode);
 
@@ -198,14 +306,7 @@ void onMeshChatReceived(const String& senderNickname, char srcNode, const String
     }
 }
 
-// In: destNode - node the original chat was sent to; msgId - its sequence
-//     number; status - MESH_DELIVERY_ACKED or MESH_DELIVERY_FAILED;
-//     elapsedMs - round-trip time in ms, meaningful only when status is
-//     MESH_DELIVERY_ACKED (always 0 for a timeout). Out: none.
-// Logs the outcome, pushes a structured "[ACK]" line (tagged with msgId so
-// the phone can match it to the specific message it sent) over BLE, and — if
-// this is the most recently sent message — fires the OLED delivery-status
-// event, passing the round-trip time along for display.
+// Logs the delivery outcome, pushes "[ACK]" over BLE, and updates the OLED if this was the last-sent message.
 void onMeshDeliveryStatus(char destNode, uint8_t msgId, MeshDeliveryStatus status, unsigned long elapsedMs) {
     bool delivered = (status == MESH_DELIVERY_ACKED);
     String statusStr = delivered ? "delivered" : "failed";
@@ -221,19 +322,13 @@ void onMeshDeliveryStatus(char destNode, uint8_t msgId, MeshDeliveryStatus statu
     }
 }
 
-// In: none. Out: none.
-// Redraws the OLED Mesh screen if it's currently showing (no-op otherwise —
-// UiHandler decides that itself).
-void onMeshDirectoryChanged() {
+// Redraws the OLED Mesh screen and marks nodeId dirty for the next coalesced BLE push.
+void onMeshDirectoryChanged(char nodeId, const String& nickname, bool removed) {
     Ui.refreshMesh();
+    markNodeDirty(nodeId);
 }
 
-// In: destNode/nextHop/cost - the changed routing entry; removed - true if
-//     destNode's route was just dropped (nextHop/cost are meaningless then).
-// Out: none. Redraws the OLED Mesh screen if it's currently showing, and
-// pushes a compact delta ("[ROUTE+]"/"[ROUTE-]") to the phone — this only
-// fires on substantive table changes (see MeshLayer::_learnRoute), so it
-// doesn't spam either surface.
+// Redraws the OLED Mesh screen, pushes a "[ROUTE+]"/"[ROUTE-]" delta, and marks destNode dirty.
 void onMeshRouteChanged(char destNode, char nextHop, uint8_t cost, bool removed) {
     Ui.refreshMesh();
 
@@ -244,11 +339,11 @@ void onMeshRouteChanged(char destNode, char nextHop, uint8_t cost, bool removed)
             Ble.send("[ROUTE+] dest=" + String(destNode) + " via=" + String(nextHop) + " cost=" + String(cost));
         }
     }
+
+    markNodeDirty(destNode);
 }
 
-// In: none (Arduino entry point, called once at boot). Out: none.
-// Brings up Serial, the OLED, the LoRa radio, the Serial-line handler, BLE,
-// and the mesh layer, wiring each one's callbacks before printing the ready banner.
+// Arduino entry point: brings up Serial, OLED, LoRa, BLE, and the mesh layer, wiring their callbacks.
 void setup() {
     Serial.begin(115200);
     delay(2000);
@@ -277,11 +372,16 @@ void setup() {
     Mesh.onDirectoryChanged(onMeshDirectoryChanged);
     Mesh.onDeliveryStatus(onMeshDeliveryStatus);
     Mesh.onRouteChanged(onMeshRouteChanged);
-    Ui.setIdentity(nodeId, "");
+
+    // Auto-configure the nickname from the node id; a later "/nick <name>" still overrides it.
+    String autoNickname = deriveDefaultNickname(nodeId);
+    Mesh.setLocalNickname(autoNickname);
+    Ui.setIdentity(nodeId, autoNickname);
 
     Serial.println("─────────────────────────────────");
     Serial.println("  LastLink Firmware - Ready");
     Serial.printf( "  Node ID: %c\n", nodeId);
+    Serial.printf( "  Nickname: %s (auto)\n", autoNickname.c_str());
     Serial.println("  Type a message + Enter to TX");
     Serial.println("  '/nick Name'        sets your nickname");
     Serial.println("  '@Name message'     sends to a specific nickname");
@@ -289,13 +389,7 @@ void setup() {
     Serial.println("─────────────────────────────────");
 }
 
-// In: none (Arduino main loop, called repeatedly). Out: none.
-// Polls the Serial/BLE/mesh/UI handlers each tick, and when a radio packet
-// has arrived, reads it, hands it to Mesh.handleIncomingPacket(), logs the
-// resulting action, and re-arms the receiver. The OLED only reacts to
-// specific named events (chat-for-me, ack-for-me, etc. via their onMesh*
-// callbacks) — arbitrary radio activity (relays, presence, duplicates) is
-// intentionally not shown on-screen.
+// Arduino main loop: polls Serial/BLE/mesh/UI, handles any received radio packet, then flushes BLE node-sync.
 void loop() {
     SerialInput.update();
     Ble.update();
@@ -328,6 +422,9 @@ void loop() {
                 case MESH_RX_ACK:
                     Serial.println("[Mesh] Ack packet received/relayed");
                     break;
+                case MESH_RX_ROUTE_ADV:
+                    Serial.println("[Mesh] Route advertisement processed");
+                    break;
                 case MESH_RX_DUPLICATE:
                     Serial.println("[Mesh] Duplicate packet dropped");
                     break;
@@ -341,4 +438,6 @@ void loop() {
 
         radio.startReceive();
     }
+
+    flushNodeSync();
 }
